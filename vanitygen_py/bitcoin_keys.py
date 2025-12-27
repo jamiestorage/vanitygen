@@ -1,7 +1,12 @@
 import os
 import ecdsa
 import hashlib
-from .crypto_utils import hash160, base58check_encode, bech32_encode
+
+# Handle both module and direct execution
+try:
+    from .crypto_utils import hash160, base58check_encode, bech32_encode
+except ImportError:
+    from crypto_utils import hash160, base58check_encode, bech32_encode
 
 class BitcoinKey:
     def __init__(self, privkey_bytes=None):
