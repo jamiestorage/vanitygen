@@ -1,0 +1,6 @@
+pyopencl
+ecdsa
+base58
+bech32
+plyvel
+PySide6

@@ -2,5 +2,10 @@
 *.o
 keyconv
 oclvanitygen
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
 oclvanityminer
 vanitygen
