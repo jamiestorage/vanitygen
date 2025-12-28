@@ -1,5 +1,6 @@
 import os
 import struct
+from typing import List
 
 # Handle both module and direct execution
 try:
@@ -45,7 +46,7 @@ class BalanceChecker:
         except Exception:
             return False
 
-    def get_bitcoin_core_db_paths(self) -> list[str]:
+    def get_bitcoin_core_db_paths(self) -> List[str]:
         """Get all plausible Bitcoin Core chainstate LevelDB paths on this machine."""
         home = os.path.expanduser("~")
         appdata = os.environ.get('APPDATA')
@@ -66,7 +67,7 @@ class BalanceChecker:
 
         network_subdirs = ["", "testnet3", "signet", "regtest"]
 
-        candidates: list[str] = []
+        candidates: List[str] = []
         for base in base_dirs:
             for net in network_subdirs:
                 chainstate_dir = os.path.join(base, net, "chainstate") if net else os.path.join(base, "chainstate")
@@ -445,11 +446,20 @@ class BalanceChecker:
 
                 if utxo_entries_seen == 0:
                     self._debug("No UTXO entries ('C' keys) were found in this chainstate database")
-                    self._debug("This usually means you're pointing at the wrong data directory/network, or the node hasn't downloaded/validated blocks yet")
-                    self._debug("Common causes:")
-                    self._debug("  - Bitcoin Core is still in headers-first sync (no validated blocks yet)")
+                    self._debug("This usually means:")
+                    self._debug("  - Bitcoin Core is still in 'headers-first' sync - it has downloaded")
+                    self._debug("    block headers but hasn't validated and committed UTXO entries yet")
+                    self._debug("  - The blockchain sync is at ~10% as you mentioned - Bitcoin Core")
+                    self._debug("    needs to fully validate blocks before adding to chainstate")
                     self._debug("  - You're using testnet/signet/regtest but reading the mainnet chainstate")
-                    self._debug("  - Snap: the synced data is under /var/snap/bitcoin-core/common/.bitcoin")
+                    self._debug("  - Snap: the synced data may be under /var/snap/bitcoin-core/common/.bitcoin")
+                    self._debug("")
+                    self._debug("The chainstate only contains UTXOs from FULLY VALIDATED blocks.")
+                    self._debug("You need to wait for Bitcoin Core to sync more blocks, OR:")
+                    self._debug("  1. Use a pre-synced Bitcoin Core node on another machine")
+                    self._debug("  2. Export funded addresses from Bitcoin Core using RPC:")
+                    self._debug("     bitcoin-cli listunspent > addresses.txt")
+                    self._debug("  3. Use the 'Load Funded Addresses File' option instead")
                 else:
                     self._debug("This could mean:")
                     self._debug("  - The blockchain is not fully synced")

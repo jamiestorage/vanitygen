@@ -35,7 +35,7 @@ class GeneratorThread(QThread):
     stats_updated = Signal(int, float)
     address_found = Signal(str, str, str, float)
     
-    def __init__(self, prefix, addr_type, balance_checker, auto_resume=False, mode='cpu', case_insensitive=False):
+    def __init__(self, prefix, addr_type, balance_checker, auto_resume=False, mode='cpu', case_insensitive=False, batch_size=4096):
         super().__init__()
         self.prefix = prefix
         self.addr_type = addr_type
@@ -43,12 +43,16 @@ class GeneratorThread(QThread):
         self.auto_resume = auto_resume
         self.mode = mode
         self.case_insensitive = case_insensitive
+        self.batch_size = batch_size
         self.generator = None
         self.running = True
 
     def run(self):
         if self.mode == 'gpu':
             self.generator = GPUGenerator(self.prefix, self.addr_type)
+            # Apply GPU settings
+            if hasattr(self, 'batch_size') and self.batch_size:
+                self.generator.batch_size = self.batch_size
         else:
             self.generator = CPUGenerator(self.prefix, self.addr_type, case_insensitive=self.case_insensitive)
         
@@ -125,8 +129,35 @@ class VanityGenGUI(QMainWindow):
         gen_mode_layout.addWidget(QLabel("Generation Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["CPU (All Cores)", "GPU (OpenCL)"])
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         gen_mode_layout.addWidget(self.mode_combo)
         settings_layout.addLayout(gen_mode_layout)
+        
+        # GPU Settings (initially hidden)
+        self.gpu_settings_widget = QWidget()
+        gpu_settings_layout = QVBoxLayout()
+        
+        # Batch size setting
+        batch_layout = QHBoxLayout()
+        batch_layout.addWidget(QLabel("GPU Batch Size:"))
+        self.batch_size_combo = QComboBox()
+        self.batch_size_combo.addItems(["1024", "2048", "4096", "8192", "16384", "32768", "65536"])
+        self.batch_size_combo.setCurrentIndex(2)  # Default to 4096
+        batch_layout.addWidget(self.batch_size_combo)
+        batch_layout.addWidget(QLabel("(Higher = faster but more memory)"))
+        gpu_settings_layout.addLayout(batch_layout)
+        
+        # Device selector
+        device_layout = QHBoxLayout()
+        device_layout.addWidget(QLabel("GPU Device:"))
+        self.gpu_device_combo = QComboBox()
+        self.gpu_device_combo.addItems(["Auto-detect"])
+        device_layout.addWidget(self.gpu_device_combo)
+        gpu_settings_layout.addLayout(device_layout)
+        
+        self.gpu_settings_widget.setLayout(gpu_settings_layout)
+        self.gpu_settings_widget.setVisible(False)  # Hidden by default
+        settings_layout.addWidget(self.gpu_settings_widget)
         
         self.balance_check = QCheckBox("Enable Balance Checking")
         settings_layout.addWidget(self.balance_check)
@@ -218,6 +249,13 @@ class VanityGenGUI(QMainWindow):
         else:
             self.log_output.append("Debug logging disabled")
 
+    def on_mode_changed(self, index):
+        """Show/hide GPU settings when mode changes."""
+        self.gpu_settings_widget.setVisible(index == 1)  # GPU mode is index 1
+        if index == 1:
+            self.log_output.append("GPU mode selected - adjust batch size for optimal performance")
+            self.log_output.append("Tip: Larger batch sizes are faster but use more GPU memory")
+
     def load_bitcoin_core(self):
         # Disable button and show loading state
         self.load_core_btn.setEnabled(False)
@@ -278,8 +316,14 @@ class VanityGenGUI(QMainWindow):
         mode = 'gpu' if self.mode_combo.currentIndex() == 1 else 'cpu'
         case_insensitive = self.case_insensitive_check.isChecked()
         
+        # Get GPU batch size if in GPU mode
+        batch_size = None
+        if mode == 'gpu':
+            batch_size = int(self.batch_size_combo.currentText())
+            self.log_output.append(f"Using GPU batch size: {batch_size}")
+        
         self.gen_thread = GeneratorThread(prefix, addr_type, self.balance_checker, 
-                                        self.auto_resume.isChecked(), mode, case_insensitive)
+                                        self.auto_resume.isChecked(), mode, case_insensitive, batch_size)
         self.gen_thread.stats_updated.connect(self.update_stats)
         self.gen_thread.address_found.connect(self.on_address_found)
         self.gen_thread.finished.connect(self.on_gen_finished)
