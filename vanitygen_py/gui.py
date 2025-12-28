@@ -9,6 +9,23 @@ from .cpu_generator import CPUGenerator
 from .gpu_generator import GPUGenerator
 from .balance_checker import BalanceChecker
 
+class LoadBitcoinCoreThread(QThread):
+    """Background thread for loading Bitcoin Core chainstate data."""
+    success = Signal(bool)
+    error = Signal(str)
+    
+    def __init__(self, balance_checker, path=None):
+        super().__init__()
+        self.balance_checker = balance_checker
+        self.path = path
+    
+    def run(self):
+        try:
+            result = self.balance_checker.load_from_bitcoin_core(self.path)
+            self.success.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
 class GeneratorThread(QThread):
     stats_updated = Signal(int, float)
     address_found = Signal(str, str, str, float)
@@ -72,6 +89,7 @@ class VanityGenGUI(QMainWindow):
         
         self.balance_checker = BalanceChecker()
         self.gen_thread = None
+        self.load_core_thread = None
         
         self.init_ui()
 
@@ -179,7 +197,20 @@ class VanityGenGUI(QMainWindow):
                 QMessageBox.critical(self, "Error", "Failed to load addresses file")
 
     def load_bitcoin_core(self):
-        if self.balance_checker.load_from_bitcoin_core():
+        # Disable button and show loading state
+        self.load_core_btn.setEnabled(False)
+        self.load_core_btn.setText("Loading...")
+        self.balance_status_label.setText("Loading Bitcoin Core data (this may take a while)...")
+        
+        # Start background thread to load data
+        self.load_core_thread = LoadBitcoinCoreThread(self.balance_checker)
+        self.load_core_thread.success.connect(self.on_load_core_success)
+        self.load_core_thread.error.connect(self.on_load_core_error)
+        self.load_core_thread.finished.connect(self.on_load_core_finished)
+        self.load_core_thread.start()
+    
+    def on_load_core_success(self, result):
+        if result:
             self.balance_status_label.setText(self.balance_checker.get_status())
             self.balance_check.setChecked(True)
             QMessageBox.information(self, "Success", "Successfully connected to Bitcoin Core data")
@@ -192,6 +223,13 @@ class VanityGenGUI(QMainWindow):
                 "- Path doesn't exist or is incorrect\n"
                 "- plyvel library not installed\n\n"
                 "Try closing Bitcoin Core and loading again, or use a file-based address list instead.")
+    
+    def on_load_core_error(self, error_message):
+        QMessageBox.critical(self, "Error", f"Failed to load Bitcoin Core data: {error_message}")
+    
+    def on_load_core_finished(self):
+        self.load_core_btn.setEnabled(True)
+        self.load_core_btn.setText("Load from Bitcoin Core Data")
 
     def toggle_generation(self):
         if self.gen_thread and self.gen_thread.isRunning():
