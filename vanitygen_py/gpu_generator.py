@@ -17,7 +17,7 @@ except ImportError:
     np = None
 
 class GPUGenerator:
-    def __init__(self, prefix, addr_type='p2pkh'):
+    def __init__(self, prefix, addr_type='p2pkh', batch_size=4096, power_percent=100, device_selector=None):
         self.prefix = prefix
         self.addr_type = addr_type
         self.result_queue = queue.Queue()
@@ -33,9 +33,12 @@ class GPUGenerator:
         self.queue = None
         self.program = None
         self.kernel = None
+        self.device = None
 
         # GPU configuration
-        self.batch_size = 4096  # Number of keys to generate per batch
+        self.batch_size = int(batch_size) if batch_size else 4096
+        self.power_percent = 100 if power_percent is None else int(power_percent)
+        self.device_selector = device_selector  # (platform_index, device_index) or None for auto
         self.rng_seed = int(time.time())
 
     def init_cl(self):
@@ -50,8 +53,31 @@ class GPUGenerator:
                 print("No OpenCL platforms found")
                 return False
 
-            # Use first platform and device
-            self.device = platforms[0].get_devices()[0]
+            # Select device
+            if self.device_selector is not None:
+                try:
+                    p_idx, d_idx = self.device_selector
+                    platform = platforms[p_idx]
+                    devices = platform.get_devices()
+                    self.device = devices[d_idx]
+                except Exception as e:
+                    print(f"Invalid OpenCL device selection {self.device_selector}: {e}")
+                    return False
+            else:
+                # Auto-detect: prefer a GPU device, otherwise fall back to the first available device
+                selected = None
+                for platform in platforms:
+                    try:
+                        gpus = platform.get_devices(device_type=cl.device_type.GPU)
+                    except Exception:
+                        gpus = []
+                    if gpus:
+                        selected = gpus[0]
+                        break
+                if selected is None:
+                    selected = platforms[0].get_devices()[0]
+                self.device = selected
+
             self.ctx = cl.Context([self.device])
             self.queue = cl.CommandQueue(self.ctx)
 
@@ -78,6 +104,28 @@ class GPUGenerator:
 
     def is_available(self):
         return self.gpu_available
+
+    @staticmethod
+    def list_available_devices():
+        if cl is None:
+            return []
+
+        devices = []
+        try:
+            for p_idx, platform in enumerate(cl.get_platforms()):
+                for d_idx, device in enumerate(platform.get_devices()):
+                    dev_type = "GPU" if (device.type & cl.device_type.GPU) else "CPU" if (device.type & cl.device_type.CPU) else "OTHER"
+                    devices.append({
+                        "platform_index": p_idx,
+                        "device_index": d_idx,
+                        "platform_name": getattr(platform, "name", str(platform)),
+                        "device_name": device.name,
+                        "device_type": dev_type,
+                    })
+        except Exception:
+            return []
+
+        return devices
 
     def _generate_keys_on_gpu(self, count):
         """Generate private keys using OpenCL GPU"""
@@ -120,12 +168,14 @@ class GPUGenerator:
     def _search_loop(self):
         """Main search loop using GPU for key generation"""
         while not self.stop_event.is_set():
+            loop_start = time.time()
+
             # Generate batch of keys on GPU
             gpu_keys = self._generate_keys_on_gpu(self.batch_size)
 
             if gpu_keys is None:
-                # Fall back to CPU if GPU fails
-                time.sleep(0.1)
+                # GPU failed for this iteration; back off a bit
+                self.stop_event.wait(timeout=0.1)
                 continue
 
             # Process keys on CPU (EC operations are complex to do on GPU)
@@ -154,6 +204,14 @@ class GPUGenerator:
             except Exception as e:
                 print(f"Error processing keys: {e}")
 
+            power = self.power_percent
+            if power is not None and power < 100:
+                duty = max(0.05, min(1.0, power / 100.0))
+                work_time = time.time() - loop_start
+                sleep_time = work_time * (1.0 / duty - 1.0)
+                if sleep_time > 0:
+                    self.stop_event.wait(timeout=sleep_time)
+
     def start(self):
         if self.running:
             return
@@ -170,7 +228,10 @@ class GPUGenerator:
                            "- OpenCL drivers are installed\n"
                            "- A compatible GPU is available")
 
-        print(f"Starting GPU-accelerated search with batch size {self.batch_size}")
+        print(
+            f"Starting GPU-accelerated search on {self.device.name if self.device else 'device'} "
+            f"(batch size={self.batch_size}, power={self.power_percent}%)"
+        )
 
         self.running = True
         self.search_thread = threading.Thread(target=self._search_loop, daemon=True)
