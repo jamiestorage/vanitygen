@@ -158,7 +158,17 @@ class BalanceChecker:
         
         try:
             # Open the chainstate LevelDB
-            db = plyvel.DB(path, create_if_missing=False, compression=None)
+            try:
+                db = plyvel.DB(path, create_if_missing=False, compression=None)
+            except Exception as db_error:
+                error_msg = str(db_error)
+                if 'lock' in error_msg.lower() or 'already held' in error_msg.lower():
+                    print(f"Failed to load Bitcoin Core DB: {db_error}")
+                    print("The chainstate database is locked by another process (likely Bitcoin Core).")
+                    print("Please close Bitcoin Core and try again, or use a file-based address list instead.")
+                else:
+                    print(f"Failed to open Bitcoin Core DB: {db_error}")
+                return False
             
             # Iterate through all entries in the database
             address_balances = {}

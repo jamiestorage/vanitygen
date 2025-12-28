@@ -8,4 +8,4 @@ ecdsa==0.18.0
 base58==2.1.1
 bech32==1.2.0
 plyvel>=1.4.0     # Requires LevelDB development files
-PySide6==6.2.4
+PySide6>=6.6.0

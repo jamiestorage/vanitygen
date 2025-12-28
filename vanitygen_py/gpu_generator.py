@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import queue
 try:
     import pyopencl as cl
 except ImportError:
@@ -12,6 +13,7 @@ class GPUGenerator:
         self.ctx = None
         self.queue = None
         self.program = None
+        self.result_queue = queue.Queue()
         
         if cl:
             self.init_cl()

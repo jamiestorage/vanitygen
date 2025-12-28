@@ -29,8 +29,14 @@ class GeneratorThread(QThread):
             self.generator = GPUGenerator(self.prefix, self.addr_type)
         else:
             self.generator = CPUGenerator(self.prefix, self.addr_type, case_insensitive=self.case_insensitive)
+        
+        try:
+            self.generator.start()
+        except RuntimeError as e:
+            # GPU not available or other startup error
+            print(f"Error starting generator: {e}")
+            return
             
-        self.generator.start()
         start_time = time.time()
         total_keys = 0
         
@@ -179,7 +185,13 @@ class VanityGenGUI(QMainWindow):
             QMessageBox.information(self, "Success", "Successfully connected to Bitcoin Core data")
         else:
             path = self.balance_checker.get_bitcoin_core_db_path()
-            QMessageBox.warning(self, "Failed", f"Could not find or load Bitcoin Core data at {path}.\n\nNote: Direct chainstate parsing requires plyvel and specific Bitcoin Core data structure.")
+            QMessageBox.warning(self, "Failed", 
+                f"Could not find or load Bitcoin Core data at {path}.\n\n"
+                "Common issues:\n"
+                "- Bitcoin Core is running (chainstate is locked)\n"
+                "- Path doesn't exist or is incorrect\n"
+                "- plyvel library not installed\n\n"
+                "Try closing Bitcoin Core and loading again, or use a file-based address list instead.")
 
     def toggle_generation(self):
         if self.gen_thread and self.gen_thread.isRunning():
