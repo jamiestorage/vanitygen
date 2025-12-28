@@ -45,28 +45,45 @@ class BalanceChecker:
         except Exception:
             return False
 
-    def get_bitcoin_core_db_path(self) -> str:
-        """Get the Bitcoin Core LevelDB database path"""
+    def get_bitcoin_core_db_paths(self) -> list[str]:
+        """Get all plausible Bitcoin Core chainstate LevelDB paths on this machine."""
         home = os.path.expanduser("~")
-        
-        # Try multiple possible Bitcoin Core data locations
-        possible_paths = [
-            # Linux snap install
-            os.path.join(home, "snap", "bitcoin-core", "common", ".bitcoin", "chainstate"),
+        appdata = os.environ.get('APPDATA')
+
+        base_dirs = [
+            # Linux snap install (per-user)
+            os.path.join(home, "snap", "bitcoin-core", "common", ".bitcoin"),
+            # Linux snap install (system-wide daemon)
+            os.path.join(os.sep, "var", "snap", "bitcoin-core", "common", ".bitcoin"),
             # Linux standard
-            os.path.join(home, ".bitcoin", "chainstate"),
+            os.path.join(home, ".bitcoin"),
             # macOS
-            os.path.join(home, "Library", "Application Support", "Bitcoin", "chainstate"),
-            # Windows
-            os.path.join(os.environ.get('APPDATA', ''), "Bitcoin", "chainstate"),
+            os.path.join(home, "Library", "Application Support", "Bitcoin"),
         ]
-        
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-        
-        # Return default path (likely to fail but consistent with old behavior)
-        return possible_paths[0]
+        if appdata:
+            # Windows
+            base_dirs.append(os.path.join(appdata, "Bitcoin"))
+
+        network_subdirs = ["", "testnet3", "signet", "regtest"]
+
+        candidates: list[str] = []
+        for base in base_dirs:
+            for net in network_subdirs:
+                chainstate_dir = os.path.join(base, net, "chainstate") if net else os.path.join(base, "chainstate")
+                if os.path.exists(chainstate_dir):
+                    candidates.append(chainstate_dir)
+
+        return candidates
+
+    def get_bitcoin_core_db_path(self) -> str:
+        """Get the default Bitcoin Core chainstate LevelDB path."""
+        candidates = self.get_bitcoin_core_db_paths()
+        if candidates:
+            return candidates[0]
+
+        # Fallback path (likely to fail, but consistent with previous behavior)
+        home = os.path.expanduser("~")
+        return os.path.join(home, "snap", "bitcoin-core", "common", ".bitcoin", "chainstate")
 
     def _parse_compact_size(self, data, offset):
         """Parse Bitcoin's compact size (varint) format"""
@@ -227,42 +244,104 @@ class BalanceChecker:
             print("plyvel is not installed. Install it with: pip install plyvel")
             return False
         
-        if path is None:
-            path = self.get_bitcoin_core_db_path()
-            self._debug(f"No path specified, using auto-detected path: {path}")
+        auto_detected = path is None
+
+        if auto_detected:
+            candidate_paths = self.get_bitcoin_core_db_paths()
+            if not candidate_paths:
+                candidate_paths = [self.get_bitcoin_core_db_path()]
+            self._debug(f"No path specified, found {len(candidate_paths)} candidate chainstate path(s)")
+            for i, candidate in enumerate(candidate_paths[:10], start=1):
+                self._debug(f"  Candidate {i}: {candidate}")
         else:
+            candidate_paths = [path]
             self._debug(f"Using specified path: {path}")
-        
-        if not os.path.exists(path):
+
+        if not auto_detected and (path is None or not os.path.exists(path)):
             self._debug(f"ERROR: Bitcoin Core chainstate not found at: {path}")
             self._debug(f"Directory exists: {os.path.exists(os.path.dirname(path))}")
-            self._debug(f"Contents of parent directory: {os.listdir(os.path.dirname(path)) if os.path.exists(os.path.dirname(path)) else 'N/A'}")
+            self._debug(
+                f"Contents of parent directory: {os.listdir(os.path.dirname(path)) if os.path.exists(os.path.dirname(path)) else 'N/A'}"
+            )
             print(f"Bitcoin Core chainstate not found at: {path}")
             return False
-        
-        self._debug(f"Chainstate directory found at: {path}")
-        self._debug(f"Directory contents: {os.listdir(path) if os.path.isdir(path) else 'Not a directory'}")
-        
+
         try:
             # Open the chainstate LevelDB
-            try:
-                self._debug("Attempting to open LevelDB...")
-                db = plyvel.DB(path, create_if_missing=False, compression=None)
-                self._debug("Successfully opened LevelDB connection")
-            except Exception as db_error:
-                error_msg = str(db_error)
-                self._debug(f"ERROR: Failed to open DB: {error_msg}")
-                if 'lock' in error_msg.lower() or 'already held' in error_msg.lower():
-                    print(f"Failed to load Bitcoin Core DB: {db_error}")
-                    print("The chainstate database is locked by another process (likely Bitcoin Core).")
-                    print("Please close Bitcoin Core and try again, or use a file-based address list instead.")
+            db = None
+            selected_path = None
+            fallback_db = None
+            fallback_path = None
+
+            for candidate_path in candidate_paths:
+                if not os.path.exists(candidate_path):
+                    continue
+
+                try:
+                    self._debug(f"Attempting to open LevelDB at: {candidate_path}")
+                    candidate_db = plyvel.DB(candidate_path, create_if_missing=False, compression=None)
+                except Exception as db_error:
+                    error_msg = str(db_error)
+                    self._debug(f"ERROR: Failed to open DB at {candidate_path}: {error_msg}")
+                    if 'lock' in error_msg.lower() or 'already held' in error_msg.lower():
+                        print(f"Failed to load Bitcoin Core DB: {db_error}")
+                        print("The chainstate database is locked by another process (likely Bitcoin Core).")
+                        print("Please close Bitcoin Core and try again, or use a file-based address list instead.")
+                        return False
+                    if not auto_detected:
+                        print(f"Failed to open Bitcoin Core DB: {db_error}")
+                        return False
+                    continue
+
+                if not auto_detected:
+                    db = candidate_db
+                    selected_path = candidate_path
+                    break
+
+                # When auto-detecting, prefer a chainstate that actually contains UTXO entries ('C' keys).
+                has_utxos = False
+                it = None
+                try:
+                    it = candidate_db.iterator(prefix=b'C')
+                    for _k, _v in it:
+                        has_utxos = True
+                        break
+                finally:
+                    if it is not None:
+                        it.close()
+
+                if has_utxos:
+                    if fallback_db is not None:
+                        fallback_db.close()
+                    db = candidate_db
+                    selected_path = candidate_path
+                    self._debug(f"Selected chainstate path (UTXO entries present): {candidate_path}")
+                    break
+
+                if fallback_db is None:
+                    fallback_db = candidate_db
+                    fallback_path = candidate_path
                 else:
-                    print(f"Failed to open Bitcoin Core DB: {db_error}")
+                    candidate_db.close()
+
+            if db is None and fallback_db is not None:
+                db = fallback_db
+                selected_path = fallback_path
+                self._debug(f"Selected chainstate path (no UTXO entries detected in other candidates): {selected_path}")
+
+            if db is None or selected_path is None:
+                print("Bitcoin Core chainstate not found at any known location")
                 return False
+
+            path = selected_path
+            self._debug(f"Chainstate directory found at: {path}")
+            self._debug(f"Directory contents: {os.listdir(path) if os.path.isdir(path) else 'Not a directory'}")
+            self._debug("Successfully opened LevelDB connection")
             
             # Iterate through all entries in the database
             address_balances = {}
             total_utxos = 0
+            utxo_entries_seen = 0
             processed_entries = 0
             skipped_entries = 0
             
@@ -270,14 +349,28 @@ class BalanceChecker:
             
             for key, value in db:
                 processed_entries += 1
-                key_prefix = key[0] if len(key) > 0 else 'empty'
-                
-                if len(key) < 1 or key[0] != ord('C'):
+                key_prefix = key[0] if len(key) > 0 else None
+                key_prefix_hex = f"0x{key_prefix:02x}" if key_prefix is not None else "empty"
+                key_prefix_chr = (
+                    chr(key_prefix)
+                    if key_prefix is not None and 32 <= key_prefix <= 126
+                    else None
+                )
+                key_prefix_display = (
+                    key_prefix_hex
+                    if key_prefix_chr is None
+                    else f"{key_prefix_hex} ('{key_prefix_chr}')"
+                )
+
+                if key_prefix is None or key_prefix != ord('C'):
                     skipped_entries += 1
                     if processed_entries <= 100:  # Log first 100 entries for debugging
-                        self._debug(f"Skipping entry {processed_entries}: key_prefix={key_prefix}, key_len={len(key)}, value_len={len(value)}")
+                        self._debug(
+                            f"Skipping entry {processed_entries}: key_prefix={key_prefix_display}, key_len={len(key)}, value_len={len(value)}"
+                        )
                     continue
 
+                utxo_entries_seen += 1
                 self._debug(f"Processing UTXO entry {processed_entries}: key_len={len(key)}, value_len={len(value)}")
 
                 # Parse the UTXO entry using modern Bitcoin Core CCoins format
@@ -342,17 +435,27 @@ class BalanceChecker:
             
             self._debug(f"Total entries processed: {processed_entries}")
             self._debug(f"Skipped entries (non-UTXO): {skipped_entries}")
+            self._debug(f"UTXO entries encountered: {utxo_entries_seen}")
             self._debug(f"UTXO entries with addresses: {total_utxos}")
             self._debug(f"Unique addresses extracted: {len(address_balances)}")
-            
+
             if not address_balances:
                 print("No addresses found in Bitcoin Core data")
                 self._debug("No addresses could be extracted from the chainstate data")
-                self._debug("This could mean:")
-                self._debug("  - The blockchain is not fully synced")
-                self._debug("  - The chainstate contains no UTXO entries yet")
-                self._debug("  - The UTXO entries don't contain recognizable address formats")
-                self._debug("  - The chainstate file format is incompatible")
+
+                if utxo_entries_seen == 0:
+                    self._debug("No UTXO entries ('C' keys) were found in this chainstate database")
+                    self._debug("This usually means you're pointing at the wrong data directory/network, or the node hasn't downloaded/validated blocks yet")
+                    self._debug("Common causes:")
+                    self._debug("  - Bitcoin Core is still in headers-first sync (no validated blocks yet)")
+                    self._debug("  - You're using testnet/signet/regtest but reading the mainnet chainstate")
+                    self._debug("  - Snap: the synced data is under /var/snap/bitcoin-core/common/.bitcoin")
+                else:
+                    self._debug("This could mean:")
+                    self._debug("  - The blockchain is not fully synced")
+                    self._debug("  - The UTXO entries don't contain recognizable address formats")
+                    self._debug("  - The chainstate file format is incompatible")
+
                 return False
             
             self.address_balances = address_balances
