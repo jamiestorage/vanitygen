@@ -1,9 +1,24 @@
 import sys
 import time
-from PySide6.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, 
-                             QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
-                             QPushButton, QComboBox, QCheckBox, QTextEdit, 
-                             QProgressBar, QFileDialog, QMessageBox)
+import multiprocessing
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QTabWidget,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QComboBox,
+    QCheckBox,
+    QTextEdit,
+    QFileDialog,
+    QMessageBox,
+    QSpinBox,
+    QSlider,
+)
 from PySide6.QtCore import QThread, Signal, Qt
 from .cpu_generator import CPUGenerator
 from .gpu_generator import GPUGenerator
@@ -35,7 +50,19 @@ class GeneratorThread(QThread):
     stats_updated = Signal(int, float)
     address_found = Signal(str, str, str, float)
     
-    def __init__(self, prefix, addr_type, balance_checker, auto_resume=False, mode='cpu', case_insensitive=False, batch_size=4096):
+    def __init__(
+        self,
+        prefix,
+        addr_type,
+        balance_checker,
+        auto_resume=False,
+        mode='cpu',
+        case_insensitive=False,
+        batch_size=4096,
+        cpu_cores=None,
+        gpu_power_percent=100,
+        gpu_device_selector=None,
+    ):
         super().__init__()
         self.prefix = prefix
         self.addr_type = addr_type
@@ -43,18 +70,31 @@ class GeneratorThread(QThread):
         self.auto_resume = auto_resume
         self.mode = mode
         self.case_insensitive = case_insensitive
+
         self.batch_size = batch_size
+        self.cpu_cores = cpu_cores
+        self.gpu_power_percent = gpu_power_percent
+        self.gpu_device_selector = gpu_device_selector
+
         self.generator = None
         self.running = True
 
     def run(self):
         if self.mode == 'gpu':
-            self.generator = GPUGenerator(self.prefix, self.addr_type)
-            # Apply GPU settings
-            if hasattr(self, 'batch_size') and self.batch_size:
-                self.generator.batch_size = self.batch_size
+            self.generator = GPUGenerator(
+                self.prefix,
+                self.addr_type,
+                batch_size=self.batch_size,
+                power_percent=self.gpu_power_percent,
+                device_selector=self.gpu_device_selector,
+            )
         else:
-            self.generator = CPUGenerator(self.prefix, self.addr_type, case_insensitive=self.case_insensitive)
+            self.generator = CPUGenerator(
+                self.prefix,
+                self.addr_type,
+                cores=self.cpu_cores,
+                case_insensitive=self.case_insensitive,
+            )
         
         try:
             self.generator.start()
@@ -128,11 +168,24 @@ class VanityGenGUI(QMainWindow):
         gen_mode_layout = QHBoxLayout()
         gen_mode_layout.addWidget(QLabel("Generation Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["CPU (All Cores)", "GPU (OpenCL)"])
+        self.mode_combo.addItems(["CPU", "GPU (OpenCL)"])
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         gen_mode_layout.addWidget(self.mode_combo)
         settings_layout.addLayout(gen_mode_layout)
-        
+
+        # CPU Settings (visible in CPU mode)
+        self.cpu_settings_widget = QWidget()
+        cpu_settings_layout = QHBoxLayout()
+        cpu_settings_layout.addWidget(QLabel("CPU Cores:"))
+        self.cpu_cores_spin = QSpinBox()
+        max_cores = multiprocessing.cpu_count()
+        self.cpu_cores_spin.setRange(1, max_cores)
+        self.cpu_cores_spin.setValue(max_cores)
+        cpu_settings_layout.addWidget(self.cpu_cores_spin)
+        cpu_settings_layout.addWidget(QLabel(f"(1-{max_cores})"))
+        self.cpu_settings_widget.setLayout(cpu_settings_layout)
+        settings_layout.addWidget(self.cpu_settings_widget)
+
         # GPU Settings (initially hidden)
         self.gpu_settings_widget = QWidget()
         gpu_settings_layout = QVBoxLayout()
@@ -146,18 +199,35 @@ class VanityGenGUI(QMainWindow):
         batch_layout.addWidget(self.batch_size_combo)
         batch_layout.addWidget(QLabel("(Higher = faster but more memory)"))
         gpu_settings_layout.addLayout(batch_layout)
-        
+
+        # Power limit
+        power_layout = QHBoxLayout()
+        power_layout.addWidget(QLabel("GPU Power:"))
+        self.gpu_power_slider = QSlider(Qt.Horizontal)
+        self.gpu_power_slider.setRange(10, 100)
+        self.gpu_power_slider.setSingleStep(10)
+        self.gpu_power_slider.setPageStep(10)
+        self.gpu_power_slider.setValue(100)
+        self.gpu_power_value_label = QLabel("100%")
+        self.gpu_power_slider.valueChanged.connect(lambda v: self.gpu_power_value_label.setText(f"{v}%"))
+        power_layout.addWidget(self.gpu_power_slider)
+        power_layout.addWidget(self.gpu_power_value_label)
+        power_layout.addWidget(QLabel("(Lower = less GPU usage)"))
+        gpu_settings_layout.addLayout(power_layout)
+
         # Device selector
         device_layout = QHBoxLayout()
         device_layout.addWidget(QLabel("GPU Device:"))
         self.gpu_device_combo = QComboBox()
-        self.gpu_device_combo.addItems(["Auto-detect"])
         device_layout.addWidget(self.gpu_device_combo)
         gpu_settings_layout.addLayout(device_layout)
         
         self.gpu_settings_widget.setLayout(gpu_settings_layout)
         self.gpu_settings_widget.setVisible(False)  # Hidden by default
         settings_layout.addWidget(self.gpu_settings_widget)
+
+        self.gpu_device_options = []
+        self.populate_gpu_devices()
         
         self.balance_check = QCheckBox("Enable Balance Checking")
         settings_layout.addWidget(self.balance_check)
@@ -249,11 +319,31 @@ class VanityGenGUI(QMainWindow):
         else:
             self.log_output.append("Debug logging disabled")
 
+    def populate_gpu_devices(self):
+        self.gpu_device_combo.clear()
+        self.gpu_device_options = [None]
+        self.gpu_device_combo.addItem("Auto-detect")
+
+        devices = GPUGenerator.list_available_devices()
+        devices = sorted(devices, key=lambda d: 0 if d.get("device_type") == "GPU" else 1)
+        for dev in devices:
+            label = f"{dev['device_name']} ({dev['device_type']})"
+            platform_name = dev.get("platform_name")
+            if platform_name:
+                label += f" - {platform_name}"
+
+            self.gpu_device_combo.addItem(label)
+            self.gpu_device_options.append((dev["platform_index"], dev["device_index"]))
+
     def on_mode_changed(self, index):
-        """Show/hide GPU settings when mode changes."""
-        self.gpu_settings_widget.setVisible(index == 1)  # GPU mode is index 1
-        if index == 1:
-            self.log_output.append("GPU mode selected - adjust batch size for optimal performance")
+        """Show/hide CPU/GPU settings when mode changes."""
+        gpu_mode = index == 1
+        self.gpu_settings_widget.setVisible(gpu_mode)
+        self.cpu_settings_widget.setVisible(not gpu_mode)
+
+        if gpu_mode:
+            self.populate_gpu_devices()
+            self.log_output.append("GPU mode selected - adjust batch size and power for optimal performance")
             self.log_output.append("Tip: Larger batch sizes are faster but use more GPU memory")
 
     def load_bitcoin_core(self):
@@ -315,15 +405,37 @@ class VanityGenGUI(QMainWindow):
         
         mode = 'gpu' if self.mode_combo.currentIndex() == 1 else 'cpu'
         case_insensitive = self.case_insensitive_check.isChecked()
-        
-        # Get GPU batch size if in GPU mode
-        batch_size = None
+
+        cpu_cores = None
+        gpu_power_percent = 100
+        gpu_device_selector = None
+        batch_size = 4096
+
         if mode == 'gpu':
             batch_size = int(self.batch_size_combo.currentText())
-            self.log_output.append(f"Using GPU batch size: {batch_size}")
-        
-        self.gen_thread = GeneratorThread(prefix, addr_type, self.balance_checker, 
-                                        self.auto_resume.isChecked(), mode, case_insensitive, batch_size)
+            gpu_power_percent = int(self.gpu_power_slider.value())
+            if self.gpu_device_options and self.gpu_device_combo.currentIndex() < len(self.gpu_device_options):
+                gpu_device_selector = self.gpu_device_options[self.gpu_device_combo.currentIndex()]
+
+            self.log_output.append(
+                f"Using GPU: batch size={batch_size}, power={gpu_power_percent}%, device={self.gpu_device_combo.currentText()}"
+            )
+        else:
+            cpu_cores = int(self.cpu_cores_spin.value())
+            self.log_output.append(f"Using CPU cores: {cpu_cores}")
+
+        self.gen_thread = GeneratorThread(
+            prefix,
+            addr_type,
+            self.balance_checker,
+            auto_resume=self.auto_resume.isChecked(),
+            mode=mode,
+            case_insensitive=case_insensitive,
+            batch_size=batch_size,
+            cpu_cores=cpu_cores,
+            gpu_power_percent=gpu_power_percent,
+            gpu_device_selector=gpu_device_selector,
+        )
         self.gen_thread.stats_updated.connect(self.update_stats)
         self.gen_thread.address_found.connect(self.on_address_found)
         self.gen_thread.finished.connect(self.on_gen_finished)
