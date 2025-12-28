@@ -415,7 +415,7 @@ You found a funded Bitcoin address with balance!<br><br>
 
 <b>Address:</b> {addr}<br>
 <b>Balance:</b> {balance:,} satoshis ({balance / 100_000_000:.8f} BTC)<br>
-<b>In Funded List:</b> {'<b><font color='green'>YES</font></b>' if is_in_funded_list else 'NO'}<br><br>
+<b>In Funded List:</b> {'<b><font color="green">YES</font></b>' if is_in_funded_list else 'NO'}<br><br>
 
 <b>Private Key:</b><br>
 <font color='red' size='-1'>{wif}</font><br><br>
