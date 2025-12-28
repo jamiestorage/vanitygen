@@ -14,6 +14,20 @@ class BalanceChecker:
         self.address_balances = {}
         self.is_loaded = False
         self.db = None
+        self.debug_mode = False
+        self.debug_messages = []
+
+    def _debug(self, message):
+        """Add debug message if debug mode is enabled."""
+        if self.debug_mode:
+            self.debug_messages.append(message)
+            print(f"[DEBUG] {message}")
+
+    def get_debug_messages(self):
+        """Retrieve all debug messages."""
+        messages = self.debug_messages.copy()
+        self.debug_messages.clear()
+        return messages
 
     def load_addresses(self, filepath):
         """Load funded addresses from a text file or binary dump."""
@@ -207,23 +221,37 @@ class BalanceChecker:
         """Load balance data from Bitcoin Core chainstate LevelDB."""
         try:
             import plyvel
+            self._debug("plyvel library imported successfully")
         except ImportError:
+            self._debug("ERROR: plyvel is not installed")
             print("plyvel is not installed. Install it with: pip install plyvel")
             return False
         
         if path is None:
             path = self.get_bitcoin_core_db_path()
+            self._debug(f"No path specified, using auto-detected path: {path}")
+        else:
+            self._debug(f"Using specified path: {path}")
         
         if not os.path.exists(path):
+            self._debug(f"ERROR: Bitcoin Core chainstate not found at: {path}")
+            self._debug(f"Directory exists: {os.path.exists(os.path.dirname(path))}")
+            self._debug(f"Contents of parent directory: {os.listdir(os.path.dirname(path)) if os.path.exists(os.path.dirname(path)) else 'N/A'}")
             print(f"Bitcoin Core chainstate not found at: {path}")
             return False
+        
+        self._debug(f"Chainstate directory found at: {path}")
+        self._debug(f"Directory contents: {os.listdir(path) if os.path.isdir(path) else 'Not a directory'}")
         
         try:
             # Open the chainstate LevelDB
             try:
+                self._debug("Attempting to open LevelDB...")
                 db = plyvel.DB(path, create_if_missing=False, compression=None)
+                self._debug("Successfully opened LevelDB connection")
             except Exception as db_error:
                 error_msg = str(db_error)
+                self._debug(f"ERROR: Failed to open DB: {error_msg}")
                 if 'lock' in error_msg.lower() or 'already held' in error_msg.lower():
                     print(f"Failed to load Bitcoin Core DB: {db_error}")
                     print("The chainstate database is locked by another process (likely Bitcoin Core).")
@@ -235,11 +263,22 @@ class BalanceChecker:
             # Iterate through all entries in the database
             address_balances = {}
             total_utxos = 0
+            processed_entries = 0
+            skipped_entries = 0
+            
+            self._debug("Starting to iterate through LevelDB entries...")
             
             for key, value in db:
-                # Skip non-UTXO entries (keys starting with 'C' for coins)
+                processed_entries += 1
+                key_prefix = key[0] if len(key) > 0 else 'empty'
+                
                 if len(key) < 1 or key[0] != ord('C'):
+                    skipped_entries += 1
+                    if processed_entries <= 100:  # Log first 100 entries for debugging
+                        self._debug(f"Skipping entry {processed_entries}: key_prefix={key_prefix}, key_len={len(key)}, value_len={len(value)}")
                     continue
+
+                self._debug(f"Processing UTXO entry {processed_entries}: key_len={len(key)}, value_len={len(value)}")
 
                 # Parse the UTXO entry using modern Bitcoin Core CCoins format
                 # Format: [version (4 bytes)] [height/coinbase flags (4 bytes)] [amount] [scriptPubKey]
@@ -247,38 +286,49 @@ class BalanceChecker:
 
                 # Read version (uint32)
                 if offset + 4 > len(value):
+                    self._debug(f"Skipping: value too short for version field (len={len(value)})")
                     continue
                 version = struct.unpack('<I', value[offset:offset+4])[0]
+                self._debug(f"  Version: {version}")
                 offset += 4
 
                 # Read height and coinbase flags (uint32, but bit-packed)
                 if offset + 4 > len(value):
+                    self._debug(f"Skipping: value too short for height_flags field (offset={offset}, len={len(value)})")
                     continue
                 height_flags = struct.unpack('<I', value[offset:offset+4])[0]
+                height = height_flags >> 1  # High bits are block height
+                is_coinbase = height_flags & 1  # Low bit is coinbase flag
+                self._debug(f"  Height: {height}, Coinbase: {is_coinbase}")
                 offset += 4
 
                 # Decode amount using Bitcoin Core's compressed format
-                # The amount encoding uses a special format where common values
-                # are stored in fewer bits, and rare values use full encoding
                 try:
                     amount, offset = self._decode_compressed_amount(value, offset)
-                except Exception:
+                    self._debug(f"  Amount: {amount} satoshis")
+                except Exception as e:
+                    self._debug(f"Skipping: Failed to decode amount: {e}")
                     continue
 
                 # Decode scriptPubKey size
                 try:
                     script_size, offset = self._parse_compact_size(value, offset)
-                except Exception:
+                    self._debug(f"  Script size: {script_size}")
+                except Exception as e:
+                    self._debug(f"Skipping: Failed to parse script size: {e}")
                     continue
 
                 # Extract scriptPubKey
                 if offset + script_size > len(value):
+                    self._debug(f"Skipping: script extends beyond value bounds (offset={offset}, script_size={script_size}, value_len={len(value)})")
                     continue
 
                 script_pubkey = value[offset:offset+script_size]
+                self._debug(f"  Script: {script_pubkey.hex()}")
 
                 # Extract address from script
                 address = self._extract_address_from_script(script_pubkey)
+                self._debug(f"  Extracted address: {address}")
 
                 if address:
                     if address in address_balances:
@@ -286,11 +336,23 @@ class BalanceChecker:
                     else:
                         address_balances[address] = amount
                     total_utxos += 1
+                    self._debug(f"  Added/updated address in balances: {address}")
             
             db.close()
             
+            self._debug(f"Total entries processed: {processed_entries}")
+            self._debug(f"Skipped entries (non-UTXO): {skipped_entries}")
+            self._debug(f"UTXO entries with addresses: {total_utxos}")
+            self._debug(f"Unique addresses extracted: {len(address_balances)}")
+            
             if not address_balances:
                 print("No addresses found in Bitcoin Core data")
+                self._debug("No addresses could be extracted from the chainstate data")
+                self._debug("This could mean:")
+                self._debug("  - The blockchain is not fully synced")
+                self._debug("  - The chainstate contains no UTXO entries yet")
+                self._debug("  - The UTXO entries don't contain recognizable address formats")
+                self._debug("  - The chainstate file format is incompatible")
                 return False
             
             self.address_balances = address_balances
@@ -301,6 +363,7 @@ class BalanceChecker:
             return True
             
         except Exception as e:
+            self._debug(f"ERROR: Exception during load: {e}")
             print(f"Failed to load Bitcoin Core DB: {e}")
             import traceback
             traceback.print_exc()

@@ -13,6 +13,7 @@ class LoadBitcoinCoreThread(QThread):
     """Background thread for loading Bitcoin Core chainstate data."""
     success = Signal(bool)
     error = Signal(str)
+    debug_info = Signal(str)
     
     def __init__(self, balance_checker, path=None):
         super().__init__()
@@ -22,6 +23,10 @@ class LoadBitcoinCoreThread(QThread):
     def run(self):
         try:
             result = self.balance_checker.load_from_bitcoin_core(self.path)
+            if self.balance_checker.debug_mode:
+                debug_msgs = self.balance_checker.get_debug_messages()
+                for msg in debug_msgs:
+                    self.debug_info.emit(msg)
             self.success.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -137,6 +142,15 @@ class VanityGenGUI(QMainWindow):
         self.load_core_btn.clicked.connect(self.load_bitcoin_core)
         settings_layout.addWidget(self.load_core_btn)
 
+        settings_layout.addWidget(QLabel("Bitcoin Core Path:"))
+        self.core_path_edit = QLineEdit()
+        self.core_path_edit.setPlaceholderText("Leave empty to auto-detect")
+        settings_layout.addWidget(self.core_path_edit)
+
+        self.debug_check = QCheckBox("Enable Debug Logging")
+        self.debug_check.clicked.connect(self.toggle_debug)
+        settings_layout.addWidget(self.debug_check)
+
         self.balance_status_label = QLabel("Balance checking not active")
         settings_layout.addWidget(self.balance_status_label)
         
@@ -196,16 +210,29 @@ class VanityGenGUI(QMainWindow):
             else:
                 QMessageBox.critical(self, "Error", "Failed to load addresses file")
 
+    def toggle_debug(self):
+        """Toggle debug mode for the balance checker."""
+        self.balance_checker.debug_mode = self.debug_check.isChecked()
+        if self.balance_checker.debug_mode:
+            self.log_output.append("Debug logging enabled")
+        else:
+            self.log_output.append("Debug logging disabled")
+
     def load_bitcoin_core(self):
         # Disable button and show loading state
         self.load_core_btn.setEnabled(False)
         self.load_core_btn.setText("Loading...")
         self.balance_status_label.setText("Loading Bitcoin Core data (this may take a while)...")
         
+        # Get custom path if provided
+        custom_path = self.core_path_edit.text().strip()
+        chosen_path = custom_path if custom_path else None
+        
         # Start background thread to load data
-        self.load_core_thread = LoadBitcoinCoreThread(self.balance_checker)
+        self.load_core_thread = LoadBitcoinCoreThread(self.balance_checker, chosen_path)
         self.load_core_thread.success.connect(self.on_load_core_success)
         self.load_core_thread.error.connect(self.on_load_core_error)
+        self.load_core_thread.debug_info.connect(self.on_load_core_debug)
         self.load_core_thread.finished.connect(self.on_load_core_finished)
         self.load_core_thread.start()
     
@@ -226,6 +253,11 @@ class VanityGenGUI(QMainWindow):
     
     def on_load_core_error(self, error_message):
         QMessageBox.critical(self, "Error", f"Failed to load Bitcoin Core data: {error_message}")
+        self.log_output.append(f"Error loading Bitcoin Core data: {error_message}")
+        
+    def on_load_core_debug(self, message):
+        if self.debug_check.isChecked():
+            self.log_output.append(f"[DEBUG] {message}")
     
     def on_load_core_finished(self):
         self.load_core_btn.setEnabled(True)
