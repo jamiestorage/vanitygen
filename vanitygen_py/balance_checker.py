@@ -1,5 +1,6 @@
 import os
 import struct
+from typing import List
 
 # Handle both module and direct execution
 try:
@@ -45,7 +46,7 @@ class BalanceChecker:
         except Exception:
             return False
 
-    def get_bitcoin_core_db_paths(self) -> list[str]:
+    def get_bitcoin_core_db_paths(self) -> List[str]:
         """Get all plausible Bitcoin Core chainstate LevelDB paths on this machine."""
         home = os.path.expanduser("~")
         appdata = os.environ.get('APPDATA')
@@ -66,7 +67,7 @@ class BalanceChecker:
 
         network_subdirs = ["", "testnet3", "signet", "regtest"]
 
-        candidates: list[str] = []
+        candidates: List[str] = []
         for base in base_dirs:
             for net in network_subdirs:
                 chainstate_dir = os.path.join(base, net, "chainstate") if net else os.path.join(base, "chainstate")
