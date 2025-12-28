@@ -867,6 +867,30 @@ class BalanceChecker:
         
         return 0
 
+    def check_balance_and_membership(self, address):
+        """
+        Check both balance and membership in funded list.
+        
+        Returns:
+            tuple: (balance, is_in_funded_list) where balance is in satoshis
+                   and is_in_funded_list is a boolean
+        """
+        if not self.is_loaded:
+            return 0, False
+        
+        # Check against loaded address file (this is the funded list)
+        if self.funded_addresses:
+            is_member = address in self.funded_addresses
+            return 1 if is_member else 0, is_member
+        
+        # Check against Bitcoin Core chainstate or CSV
+        if self.address_balances:
+            balance = self.address_balances.get(address, 0)
+            is_member = balance > 0
+            return balance, is_member
+        
+        return 0, False
+
     def get_status(self):
         """Get status message"""
         if self.is_loaded:

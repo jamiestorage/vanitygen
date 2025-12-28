@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSpinBox,
     QSlider,
+    QProgressBar,
 )
 from PySide6.QtCore import QThread, Signal, Qt
 from .cpu_generator import CPUGenerator
@@ -48,7 +49,7 @@ class LoadBitcoinCoreThread(QThread):
 
 class GeneratorThread(QThread):
     stats_updated = Signal(int, float)
-    address_found = Signal(str, str, str, float)
+    address_found = Signal(str, str, str, float, bool)
     
     def __init__(
         self,
@@ -117,8 +118,8 @@ class GeneratorThread(QThread):
             # Check results
             while not self.generator.result_queue.empty():
                 addr, wif, pubkey = self.generator.result_queue.get()
-                balance = self.balance_checker.check_balance(addr)
-                self.address_found.emit(addr, wif, pubkey, balance)
+                balance, is_in_funded_list = self.balance_checker.check_balance_and_membership(addr)
+                self.address_found.emit(addr, wif, pubkey, balance, is_in_funded_list)
                 if balance > 0 and not self.auto_resume:
                     # Pause if funded address found (as per requirements)
                     self.running = False
@@ -265,6 +266,39 @@ class VanityGenGUI(QMainWindow):
         # Progress Tab
         progress_tab = QWidget()
         progress_layout = QVBoxLayout()
+        
+        # Status indicators container
+        status_container = QWidget()
+        status_layout = QHBoxLayout()
+        
+        # CPU Status
+        cpu_status_layout = QVBoxLayout()
+        cpu_status_layout.addWidget(QLabel("CPU Status:"))
+        self.cpu_status_label = QLabel("Idle")
+        self.cpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+        cpu_status_layout.addWidget(self.cpu_status_label)
+        self.cpu_activity_bar = QProgressBar()
+        self.cpu_activity_bar.setRange(0, 100)
+        self.cpu_activity_bar.setValue(0)
+        self.cpu_activity_bar.setFormat("%p%")
+        cpu_status_layout.addWidget(self.cpu_activity_bar)
+        status_layout.addLayout(cpu_status_layout)
+        
+        # GPU Status  
+        gpu_status_layout = QVBoxLayout()
+        gpu_status_layout.addWidget(QLabel("GPU Status:"))
+        self.gpu_status_label = QLabel("Idle")
+        self.gpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+        gpu_status_layout.addWidget(self.gpu_status_label)
+        self.gpu_activity_bar = QProgressBar()
+        self.gpu_activity_bar.setRange(0, 100)
+        self.gpu_activity_bar.setValue(0)
+        self.gpu_activity_bar.setFormat("%p%")
+        gpu_status_layout.addWidget(self.gpu_activity_bar)
+        status_layout.addLayout(gpu_status_layout)
+        
+        status_container.setLayout(status_layout)
+        progress_layout.addWidget(status_container)
         
         self.stats_label = QLabel("Keys Searched: 0 | Speed: 0 keys/s")
         progress_layout.addWidget(self.stats_label)
@@ -451,9 +485,44 @@ class VanityGenGUI(QMainWindow):
 
     def update_stats(self, total_keys, speed):
         self.stats_label.setText(f"Keys Searched: {total_keys} | Speed: {speed:.2f} keys/s")
+        
+        # Update CPU/GPU activity bars based on current mode
+        if self.gen_thread and self.gen_thread.isRunning():
+            if self.gen_thread.mode == 'cpu':
+                # Simulate CPU activity based on speed
+                cpu_activity = min(95, int(speed / 1000000 * 100))  # Scale to millions of keys/s
+                self.cpu_activity_bar.setValue(cpu_activity)
+                self.cpu_status_label.setText(f"Active ({self.gen_thread.cpu_cores or multiprocessing.cpu_count()} cores)")
+                self.cpu_status_label.setStyleSheet("color: green; font-weight: bold;")
+                
+                # GPU idle
+                self.gpu_activity_bar.setValue(0)
+                self.gpu_status_label.setText("Idle")
+                self.gpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+            else:
+                # GPU active
+                gpu_activity = min(95, int(self.gen_thread.gpu_power_percent * 0.9))  # Use power setting as activity
+                self.gpu_activity_bar.setValue(gpu_activity)
+                self.gpu_status_label.setText(f"Active ({self.gen_thread.gpu_power_percent}%)")
+                self.gpu_status_label.setStyleSheet("color: green; font-weight: bold;")
+                
+                # CPU idle (minimal activity for thread management)
+                self.cpu_activity_bar.setValue(5)
+                self.cpu_status_label.setText("Idle (Management)")
+                self.cpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+        else:
+            # Generation stopped - both idle
+            self.cpu_activity_bar.setValue(0)
+            self.cpu_status_label.setText("Idle")
+            self.cpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+            
+            self.gpu_activity_bar.setValue(0)
+            self.gpu_status_label.setText("Idle")
+            self.gpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
 
-    def on_address_found(self, addr, wif, pubkey, balance):
-        result_str = f"Address: {addr}\nPrivate Key: {wif}\nPublic Key: {pubkey}\nBalance: {balance}\n" + "-"*40 + "\n"
+    def on_address_found(self, addr, wif, pubkey, balance, is_in_funded_list):
+        membership_status = "✓ YES" if is_in_funded_list else "✗ NO"
+        result_str = f"Address: {addr}\nPrivate Key: {wif}\nPublic Key: {pubkey}\nBalance: {balance}\nIn Funded List: {membership_status}\n" + "-"*40 + "\n"
         self.results_list.append(result_str)
         self.log_output.append(f"Match found: {addr}")
         
@@ -461,7 +530,7 @@ class VanityGenGUI(QMainWindow):
             self.log_output.append("!!! FUNDED ADDRESS FOUND !!!")
             if not self.auto_resume.isChecked():
                 # The thread already stopped itself if balance > 0
-                QMessageBox.information(self, "Funded Address Found!", f"Found a funded address: {addr}\nBalance: {balance}")
+                QMessageBox.information(self, "Funded Address Found!", f"Found a funded address: {addr}\nBalance: {balance}\nIn Funded List: {'YES' if is_in_funded_list else 'NO'}")
             else:
                 # If auto-resume is checked, we should restart if it stopped, 
                 # but wait, how about we just don't stop it in the first place?
