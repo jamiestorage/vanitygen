@@ -1,9 +1,10 @@
-# System dependencies required: 
+# System dependencies required:
 # Linux: ocl-icd-opencl-dev opencl-headers libleveldb-dev build-essential
 # macOS: brew install opencl-headers leveldb
 
 pybind11>=2.10.1
 pyopencl>=2022.1  # Requires OpenCL headers
+numpy>=1.21.0     # Required for OpenCL buffer operations
 ecdsa==0.18.0
 base58==2.1.1
 bech32==1.2.0
