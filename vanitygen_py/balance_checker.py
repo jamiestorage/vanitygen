@@ -98,6 +98,68 @@ class BalanceChecker:
                 return 0, offset
             return struct.unpack('<Q', data[offset:offset+8])[0], offset + 8
 
+    def _decode_compressed_amount(self, data, offset):
+        """
+        Decode Bitcoin Core's compressed amount format (CTxOutCompressor).
+
+        Based on Bitcoin Core's compressor.h implementation:
+        - CompressAmount removes trailing zeros and encodes the mantissa
+        - DecompressAmount reverses this process
+
+        The algorithm stores amounts in a compressed format that optimizes
+        for common satoshi values (ending in zeros).
+        """
+        if offset >= len(data):
+            return 0, offset
+
+        # Read the varint that encodes the compressed amount
+        n = data[offset]
+        offset += 1
+
+        if n < 0xfd:
+            xn = n
+        elif n == 0xfd:
+            if offset + 2 > len(data):
+                return 0, offset
+            xn = struct.unpack('<H', data[offset:offset+2])[0]
+            offset += 2
+        elif n == 0xfe:
+            if offset + 4 > len(data):
+                return 0, offset
+            xn = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+        else:
+            if offset + 8 > len(data):
+                return 0, offset
+            xn = struct.unpack('<Q', data[offset:offset+8])[0]
+            offset += 8
+
+        # Decompress using Bitcoin Core's algorithm
+        # From compressor.h: uint64_t DecompressAmount(uint64_t x)
+        if xn == 0:
+            return 0, offset
+
+        xn -= 1  # Subtract 1 (encoding adds 1)
+        e = xn % 10  # Extract the exponent (number of trailing zeros)
+        xn //= 10
+
+        n = 0
+        if e < 9:
+            # Decode mantissa: (x % 9) gives digit (1-9)
+            d = (xn % 9) + 1
+            xn //= 9
+            n = xn * 10 + d
+        else:
+            # e == 9 means large amounts
+            n = xn + 1
+
+        # Add back trailing zeros
+        while e > 0:
+            n *= 10
+            e -= 1
+
+        return n, offset
+
     def _extract_address_from_script(self, script):
         """Extract Bitcoin address from scriptPubKey"""
         if len(script) < 1:
@@ -178,39 +240,46 @@ class BalanceChecker:
                 # Skip non-UTXO entries (keys starting with 'C' for coins)
                 if len(key) < 1 or key[0] != ord('C'):
                     continue
-                
-                # Parse the UTXO entry
-                # Value format: [varint code] [amount] [scriptPubKey_size] [scriptPubKey]
-                # Note: Modern Bitcoin Core uses a different format
+
+                # Parse the UTXO entry using modern Bitcoin Core CCoins format
+                # Format: [version (4 bytes)] [height/coinbase flags (4 bytes)] [amount] [scriptPubKey]
                 offset = 0
-                
-                # Decode the compact size (usually 0 for coin entries)
-                try:
-                    code, offset = self._parse_compact_size(value, offset)
-                except:
+
+                # Read version (uint32)
+                if offset + 4 > len(value):
                     continue
-                
-                # Decode amount (in satoshis)
-                try:
-                    amount, offset = self._decode_varint_amount(value, offset)
-                except:
+                version = struct.unpack('<I', value[offset:offset+4])[0]
+                offset += 4
+
+                # Read height and coinbase flags (uint32, but bit-packed)
+                if offset + 4 > len(value):
                     continue
-                
+                height_flags = struct.unpack('<I', value[offset:offset+4])[0]
+                offset += 4
+
+                # Decode amount using Bitcoin Core's compressed format
+                # The amount encoding uses a special format where common values
+                # are stored in fewer bits, and rare values use full encoding
+                try:
+                    amount, offset = self._decode_compressed_amount(value, offset)
+                except Exception:
+                    continue
+
                 # Decode scriptPubKey size
                 try:
                     script_size, offset = self._parse_compact_size(value, offset)
-                except:
+                except Exception:
                     continue
-                
+
                 # Extract scriptPubKey
                 if offset + script_size > len(value):
                     continue
-                
+
                 script_pubkey = value[offset:offset+script_size]
-                
+
                 # Extract address from script
                 address = self._extract_address_from_script(script_pubkey)
-                
+
                 if address:
                     if address in address_balances:
                         address_balances[address] += amount
