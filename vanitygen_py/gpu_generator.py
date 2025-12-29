@@ -115,50 +115,73 @@ class GPUGenerator:
         Args:
             balance_checker: A BalanceChecker instance with addresses loaded
         """
+        print("[DEBUG] set_balance_checker() - Setting up balance checker...")
+        
         self.balance_checker = balance_checker
         if balance_checker and balance_checker.is_loaded:
-            print("Balance checker configured for GPU-accelerated checking")
+            print("[DEBUG] set_balance_checker() - Balance checker loaded, setting up GPU buffers...")
+            
+            # Setup bloom filter for GPU balance checking
+            print("[DEBUG] set_balance_checker() - Creating GPU bloom filter...")
             self._setup_gpu_balance_check()
+            
+            # Also try to setup exact address list in GPU memory (no false positives)
+            print("[DEBUG] set_balance_checker() - Attempting to load full address list to GPU memory...")
+            gpu_list_loaded = self._setup_gpu_address_list()
+            
+            if gpu_list_loaded:
+                print("[DEBUG] set_balance_checker() - ✓ Full address list loaded to GPU memory (exact matching)")
+            else:
+                print("[DEBUG] set_balance_checker() - Using bloom filter only (may have false positives)")
         else:
-            print("Warning: Balance checker not ready (no addresses loaded)")
+            print("[DEBUG] set_balance_checker() - WARNING: Balance checker not ready (no addresses loaded)")
 
     def _setup_gpu_balance_check(self):
         """Set up GPU buffers for balance checking"""
+        print("[DEBUG] _setup_gpu_balance_check() - Starting GPU balance check setup...")
+        
         if not self.balance_checker or not self.ctx:
+            print("[DEBUG] _setup_gpu_balance_check() - FAILED: No balance checker or OpenCL context")
             return
 
         try:
+            print("[DEBUG] _setup_gpu_balance_check() - Creating bloom filter...")
             # Create bloom filter
             self.bloom_filter, self.bloom_filter_size = self.balance_checker.create_bloom_filter()
             if self.bloom_filter is None:
-                print("Failed to create bloom filter")
+                print("[DEBUG] _setup_gpu_balance_check() - FAILED: Could not create bloom filter")
                 return
 
             # Create address buffer for verification
+            print("[DEBUG] _setup_gpu_balance_check() - Creating address buffer...")
             self.address_buffer = self.balance_checker.create_gpu_address_buffer()
             if self.address_buffer is None:
-                print("Failed to create address buffer")
+                print("[DEBUG] _setup_gpu_balance_check() - FAILED: Could not create address buffer")
                 return
 
             # Allocate GPU buffers
             mf = cl.mem_flags
 
             # Bloom filter buffer
+            print("[DEBUG] _setup_gpu_balance_check() - Allocating GPU bloom filter buffer...")
             self.gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                               hostbuf=np.frombuffer(self.bloom_filter, dtype=np.uint8))
 
             # Address buffer for verification (contains hash160 + address pairs)
+            print("[DEBUG] _setup_gpu_balance_check() - Allocating GPU address buffer...")
             self.gpu_address_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                                 hostbuf=np.frombuffer(self.address_buffer, dtype=np.uint8))
 
             # Found count buffer (for tracking potential matches)
+            print("[DEBUG] _setup_gpu_balance_check() - Allocating GPU found count buffer...")
             self.found_count_buffer = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
 
-            print(f"GPU balance checking enabled: {len(self.bloom_filter)} byte bloom filter, "
-                  f"{len(self.address_buffer)} byte address buffer")
+            print(f"[DEBUG] _setup_gpu_balance_check() - ✓ SUCCESS: GPU balance checking enabled")
+            print(f"[DEBUG] _setup_gpu_balance_check() - Bloom filter: {len(self.bloom_filter)} bytes")
+            print(f"[DEBUG] _setup_gpu_balance_check() - Address buffer: {len(self.address_buffer)} bytes")
 
         except Exception as e:
-            print(f"Failed to setup GPU balance checking: {e}")
+            print(f"[DEBUG] _setup_gpu_balance_check() - FAILED: {e}")
             import traceback
             traceback.print_exc()
 
@@ -173,28 +196,32 @@ class GPUGenerator:
         Returns:
             bool: True if setup successful, False otherwise
         """
+        print("[DEBUG] _setup_gpu_address_list() - Starting GPU address list setup...")
+        
         if not self.balance_checker or not self.ctx:
+            print("[DEBUG] _setup_gpu_address_list() - FAILED: No balance checker or OpenCL context")
             return False
         
         try:
+            print("[DEBUG] _setup_gpu_address_list() - Creating GPU address list (sorted array format)...")
             # Create GPU address list (sorted array format)
             address_list_info = self.balance_checker.create_gpu_address_list(format='sorted_array')
             if address_list_info is None:
-                print("Failed to create GPU address list")
+                print("[DEBUG] _setup_gpu_address_list() - FAILED: Could not create GPU address list")
                 return False
             
             # Check GPU memory availability
             device_mem = self.device.global_mem_size
             required_mem = address_list_info['size_bytes']
             
-            print(f"GPU memory available: {device_mem / (1024**3):.2f} GB")
-            print(f"Address list size: {required_mem / (1024**2):.2f} MB ({address_list_info['count']} addresses)")
+            print(f"[DEBUG] _setup_gpu_address_list() - GPU memory available: {device_mem / (1024**3):.2f} GB")
+            print(f"[DEBUG] _setup_gpu_address_list() - Address list size: {required_mem / (1024**2):.2f} MB ({address_list_info['count']} addresses)")
             
             # Ensure we have at least 2x the required memory (for other buffers)
             if required_mem * 2 > device_mem:
-                print(f"WARNING: Insufficient GPU memory!")
-                print(f"Required: {required_mem * 2 / (1024**2):.2f} MB (including overhead)")
-                print(f"Available: {device_mem / (1024**2):.2f} MB")
+                print(f"[DEBUG] _setup_gpu_address_list() - WARNING: Insufficient GPU memory!")
+                print(f"[DEBUG] _setup_gpu_address_list() - Required: {required_mem * 2 / (1024**2):.2f} MB (including overhead)")
+                print(f"[DEBUG] _setup_gpu_address_list() - Available: {device_mem / (1024**2):.2f} MB")
                 return False
             
             # Allocate GPU buffer for address list
@@ -207,14 +234,14 @@ class GPUGenerator:
             )
             self.gpu_address_list_count = address_list_info['count']
             
-            print(f"GPU address list loaded successfully: {self.gpu_address_list_count} addresses")
-            print(f"Memory usage: {required_mem / (1024**2):.2f} MB")
-            print("Using exact matching (NO false positives)")
+            print(f"[DEBUG] _setup_gpu_address_list() - ✓ SUCCESS: {self.gpu_address_list_count} addresses loaded to GPU")
+            print(f"[DEBUG] _setup_gpu_address_list() - Memory usage: {required_mem / (1024**2):.2f} MB")
+            print(f"[DEBUG] _setup_gpu_address_list() - Using exact matching (NO false positives)")
             
             return True
             
         except Exception as e:
-            print(f"Failed to setup GPU address list: {e}")
+            print(f"[DEBUG] _setup_gpu_address_list() - FAILED: {e}")
             import traceback
             traceback.print_exc()
             return False
