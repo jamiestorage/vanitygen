@@ -513,6 +513,7 @@ class GPUGenerator:
                 try:
                     print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Resetting found count on GPU...")
                     # Reset found count on GPU
+                    found_count[0] = 0  # Reset to 0 before copying to GPU
                     cl.enqueue_copy(self.queue, found_count_buf, found_count)
                     self.queue.finish()
 
@@ -754,6 +755,7 @@ class GPUGenerator:
                 try:
                     print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Resetting found count on GPU...")
                     # Reset found count on GPU
+                    found_count[0] = 0  # Reset to 0 before copying to GPU
                     cl.enqueue_copy(self.queue, found_count_buf, found_count)
                     self.queue.finish()
 
@@ -949,6 +951,7 @@ class GPUGenerator:
                 
                 try:
                     # Reset found count on GPU
+                    found_count[0] = 0  # Reset to 0 before copying to GPU
                     cl.enqueue_copy(self.queue, found_count_buf, found_count)
                     self.queue.finish()
 
