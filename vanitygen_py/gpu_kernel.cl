@@ -1,659 +1,260 @@
 /*
  * OpenCL kernel for GPU-accelerated vanity address generation with balance checking
- *
- * This kernel provides:
- * - Random private key generation
- * - SHA256 and RIPEMD160 hash computation (hash160)
- * - Base58 encoding for P2PKH addresses
- * - Prefix matching for vanity search
- * - Bloom filter for GPU-side balance checking
+ * True GPU acceleration with real SECP256K1 EC operations.
  */
 
-// SHA256 constants
-__constant uint K[64] = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-};
+typedef uint bn_word;
+typedef struct { bn_word d[8]; } bignum;
 
-// RIPEMD160 constants
-__constant uint RK[5] = { 0x00000000, 0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xa953fd4e };
-__constant uint RKK[5] = { 0x50a28be6, 0x5c4dd124, 0x6d703ef3, 0x7a6d76e9, 0x00000000 };
+#define MODULUS_BYTES 0xfffffc2f, 0xfffffffe, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff
+__constant bn_word modulus[] = { MODULUS_BYTES };
+__constant bn_word mont_n0 = 0xd2253531;
+__constant bn_word mont_rr[] = { 0xe90a1, 0x7a2, 0x1, 0, 0, 0, 0, 0 };
 
-// Base58 character set
 __constant char BASE58_CHARS[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-// Bloom filter parameters (for GPU balance checking)
-#define BLOOM_HASH_COUNT 7
-#define BLOOM_BITS_PER_ITEM 10
+#define bswap32(v) (((v) >> 24) | (((v) >> 8) & 0xff00) | (((v) << 8) & 0xff0000) | ((v) << 24))
 
-// Rotate left
-uint rotl(uint x, int n) {
-    return (x << n) | (x >> (32 - n));
+// BIGNUM Basic Ops
+void bn_rshift1(bignum *bn) {
+    for (int i = 0; i < 7; i++) bn->d[i] = (bn->d[i+1] << 31) | (bn->d[i] >> 1);
+    bn->d[7] >>= 1;
 }
 
-uint rotr(uint x, int n) {
-    return (x >> n) | (x << (32 - n));
+bn_word bn_uadd_c(bignum *r, bignum *a, __constant bn_word *b) {
+    ulong t, c = 0;
+    for (int i = 0; i < 8; i++) { t = (ulong)a->d[i] + b[i] + c; r->d[i] = (bn_word)t; c = t >> 32; }
+    return (bn_word)c;
 }
 
-// SHA256 functions
-uint ch(uint x, uint y, uint z) { return (x & y) ^ (~x & z); }
-uint maj(uint x, uint y, uint z) { return (x & y) ^ (x & z) ^ (y & z); }
-uint sigma0(uint x) { return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22); }
-uint sigma1(uint x) { return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25); }
-uint gamma0(uint x) { return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3); }
-uint gamma1(uint x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10); }
-
-// RIPEMD160 functions
-uint F(int j, uint x, uint y, uint z) {
-    if (j < 0) return x ^ y ^ z;
-    if (j < 1) return (x & y) | (~x & z);
-    if (j < 2) return (x | ~y) ^ z;
-    if (j < 3) return (x & z) | (y & ~z);
-    return x ^ (y | ~z);
+bn_word bn_uadd(bignum *r, bignum *a, bignum *b) {
+    ulong t, c = 0;
+    for (int i = 0; i < 8; i++) { t = (ulong)a->d[i] + b->d[i] + c; r->d[i] = (bn_word)t; c = t >> 32; }
+    return (bn_word)c;
 }
 
-uint K_F(int j) { return RK[(j < 20 ? 0 : (j < 40 ? 1 : (j < 60 ? 2 : 3)))]; }
-uint K_K(int j) { return RKK[(j < 20 ? 0 : (j < 40 ? 1 : (j < 60 ? 2 : 3)))]; }
-
-// Simple hash function for bloom filter
-uint bloom_hash(uint3 data, uint seed, uint m) {
-    uint h = data.x ^ (seed * 0x9e3779b9);
-    h = (h ^ (h >> 16)) * 0x85ebca6b;
-    h = (h ^ (h >> 13)) * 0xc2b2ae35;
-    h ^= data.y * seed;
-    h = (h ^ (h >> 16)) * 0x85ebca6b;
-    h = (h ^ (h >> 13)) * 0xc2b2ae35;
-    h ^= data.z * seed * 2;
-    return h % m;
+bn_word bn_usub(bignum *r, bignum *a, bignum *b) {
+    long t, c = 0;
+    for (int i = 0; i < 8; i++) { t = (long)a->d[i] - (long)b->d[i] - c; r->d[i] = (bn_word)t; c = (t < 0) ? 1 : 0; }
+    return (bn_word)c;
 }
 
-// Check if address matches bloom filter (might be a match)
-bool bloom_might_contain(__global uchar* bloom_filter, uint filter_size, uint3 addr_hash) {
-    uint filter_bits = filter_size * 8;
-    
-    for (uint i = 0; i < BLOOM_HASH_COUNT; i++) {
-        uint bit_idx = bloom_hash(addr_hash, i, filter_bits);
-        uint byte_idx = bit_idx / 8;
-        uint bit_offset = bit_idx % 8;
-        
-        // Check the specific bit, not the whole byte
-        if (!(bloom_filter[byte_idx] & (1 << bit_offset))) {
-            return false;
-        }
-    }
-    return true;
+bn_word bn_usub_c(bignum *r, bignum *a, __constant bn_word *b) {
+    long t, c = 0;
+    for (int i = 0; i < 8; i++) { t = (long)a->d[i] - (long)b[i] - c; r->d[i] = (bn_word)t; c = (t < 0) ? 1 : 0; }
+    return (bn_word)c;
 }
 
-// Compute SHA256 - all private memory
-void sha256_compute(uchar* input, uint input_len, uchar* output) {
-    uint h[8] = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-    };
+int bn_ucmp_ge(bignum *a, bignum *b) {
+    for (int i = 7; i >= 0; i--) { if (a->d[i] > b->d[i]) return 1; if (a->d[i] < b->d[i]) return 0; }
+    return 1;
+}
 
-    uchar block[64];
-    for (int i = 0; i < 64; i++) {
-        block[i] = (i < input_len) ? input[i] : 0;
-    }
-    block[input_len] = 0x80;
+int bn_ucmp_ge_c(bignum *a, __constant bn_word *b) {
+    for (int i = 7; i >= 0; i--) { if (a->d[i] > b[i]) return 1; if (a->d[i] < b[i]) return 0; }
+    return 1;
+}
 
-    uint bit_len = input_len * 8;
-    block[56] = (bit_len >> 0) & 0xff;
-    block[57] = (bit_len >> 8) & 0xff;
-    block[58] = (bit_len >> 16) & 0xff;
-    block[59] = (bit_len >> 24) & 0xff;
+void bn_mod_add(bignum *r, bignum *a, bignum *b) { if (bn_uadd(r, a, b) || bn_ucmp_ge_c(r, modulus)) bn_usub_c(r, r, modulus); }
+void bn_mod_sub(bignum *r, bignum *a, bignum *b) { if (bn_usub(r, a, b)) bn_uadd_c(r, r, modulus); }
 
-    uint w[64];
-    for (int i = 0; i < 16; i++) {
-        w[i] = (block[i*4+0] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | (block[i*4+3]);
-    }
-    for (int i = 16; i < 64; i++) {
-        w[i] = gamma1(w[i-2]) + gamma0(w[i-15]) + w[i-7] + w[i-16];
-    }
-
-    uint a = h[0], b = h[1], c = h[2], d = h[3];
-    uint e = h[4], f = h[5], g = h[6], h7 = h[7];
-
-    for (int i = 0; i < 64; i++) {
-        uint S0 = sigma0(a), S1 = sigma1(e);
-        uint maj = (a & b) ^ (a & c) ^ (b & c);
-        uint tr1 = h7 + sigma1(e) + ch(e, f, g) + K[i] + w[i];
-        uint tr2 = S0 + maj;
-
-        h7 = g; g = f; f = e;
-        e = d + tr1;
-        d = c; c = b; b = a;
-        a = tr1 + tr2;
-    }
-
-    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-    h[4] += e; h[5] += f; h[6] += g; h[7] += h7;
-
+void bn_mul_mont(bignum *r, bignum *a, bignum *b) {
+    uint t[16] = {0};
     for (int i = 0; i < 8; i++) {
-        output[i*4+0] = (h[i] >> 24) & 0xff;
-        output[i*4+1] = (h[i] >> 16) & 0xff;
-        output[i*4+2] = (h[i] >> 8) & 0xff;
-        output[i*4+3] = h[i] & 0xff;
+        ulong c = 0;
+        for (int j = 0; j < 8; j++) { ulong v = (ulong)a->d[j] * b->d[i] + t[j] + c; t[j] = (uint)v; c = v >> 32; }
+        uint m = t[0] * mont_n0;
+        ulong v = (ulong)m * modulus[0] + t[0]; c = v >> 32;
+        for (int j = 1; j < 8; j++) { v = (ulong)m * modulus[j] + t[j] + c; t[j-1] = (uint)v; c = v >> 32; }
+        t[7] = (uint)((ulong)t[8] + c);
     }
+    for (int i = 0; i < 8; i++) r->d[i] = t[i];
+    if (bn_ucmp_ge_c(r, modulus)) bn_usub_c(r, r, modulus);
 }
 
-// RIPEMD160 compress - all private memory
-void ripemd160_compress_local(uint* h, uint* block) {
-    uint a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
-    uint aa = a, bb = b, cc = c, dd = d, ee = e;
-    uint X[16];
-
-    for (int i = 0; i < 16; i++)
-        X[i] = block[i];
-
-    for (int j = 0; j < 80; j++) {
-        uint T;
-        if (j < 16) {
-            T = F(j, b, c, d);
-        } else if (j < 32) {
-            T = F(j - 16, b, c, d);
-        } else if (j < 48) {
-            T = F(j - 32, b, c, d);
-        } else if (j < 64) {
-            T = F(j - 48, b, c, d);
-        } else {
-            T = F(j - 64, b, c, d);
+void bn_mod_inverse(bignum *r, bignum *n) {
+    bignum a, b, x, y; for (int i = 0; i < 8; i++) { a.d[i] = modulus[i]; x.d[i] = 0; y.d[i] = 0; }
+    b = *n; x.d[0] = 1; bn_word xc = 0, yc = 0;
+    while (!(b.d[0]==0 && b.d[1]==0 && b.d[2]==0 && b.d[3]==0 && b.d[4]==0 && b.d[5]==0 && b.d[6]==0 && b.d[7]==0)) {
+        while (!(b.d[0] & 1)) {
+            if (x.d[0] & 1) xc += bn_uadd_c(&x, &x, modulus);
+            bn_rshift1(&x); x.d[7] |= (xc << 31); xc >>= 1;
+            bn_rshift1(&b);
         }
-
-        T = a + T + X[(j % 16) ^ ((j + 2) % 16)] + K_F(j);
-        T = rotl(T, 5) + e;
-        a = e; e = d; d = rotl(c, 10); c = b; b = T;
-
-        T = aa + F(79 - j, bb, cc, dd) + X[(j % 16) ^ ((j + 8) % 16)] + K_K(j);
-        T = rotl(T, 5) + ee;
-        aa = ee; ee = dd; dd = rotl(cc, 10); cc = bb; bb = T;
+        while (!(a.d[0] & 1)) {
+            if (y.d[0] & 1) yc += bn_uadd_c(&y, &y, modulus);
+            bn_rshift1(&y); y.d[7] |= (yc << 31); yc >>= 1;
+            bn_rshift1(&a);
+        }
+        if (bn_ucmp_ge(&b, &a)) { bn_mod_sub(&b, &b, &a); bn_mod_sub(&x, &x, &y); }
+        else { bn_mod_sub(&a, &a, &b); bn_mod_sub(&y, &y, &x); }
     }
-
-    uint tmp = h[1] + c + dd;
-    h[1] = h[2] + d + ee;
-    h[2] = h[3] + e + aa;
-    h[3] = h[4] + a + bb;
-    h[4] = h[0] + b + cc;
-    h[0] = tmp;
+    while (yc < 0x80000000) yc -= bn_usub_c(&y, &y, modulus);
+    for(int i=0; i<8; i++) y.d[i] = ~y.d[i];
+    bn_word carry = 1; for(int i=0; i<8; i++) { ulong t = (ulong)y.d[i] + (ulong)carry; y.d[i] = (bn_word)t; carry = (bn_word)(t >> 32); }
+    *r = y;
 }
 
-// Compute hash160 - all private memory
-void hash160_compute(uchar* input, uint input_len, uchar* output) {
-    // First compute SHA256
-    uchar sha256_hash[32];
-    sha256_compute(input, input_len, sha256_hash);
+void bn_to_mont(bignum *r, bignum *a) { bignum rr; for(int i=0; i<8; i++) rr.d[i] = mont_rr[i]; bn_mul_mont(r, a, &rr); }
+void bn_from_mont(bignum *r, bignum *a) { bignum one; for(int i=0; i<8; i++) one.d[i] = 0; one.d[0] = 1; bn_mul_mont(r, a, &one); }
 
-    // Then compute RIPEMD160
-    uint h[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
+// SECP256K1 Point Ops
+__constant bn_word Gx[] = { 0x16F81798, 0x59F2815B, 0x2DCE28D9, 0x029BFCDB, 0xCE870B07, 0x55A06295, 0xF9DCBBAC, 0x79BE667E };
+__constant bn_word Gy[] = { 0x483ADA77, 0x26A3C465, 0x5DA4FBFC, 0x0E1108A8, 0xFD17B448, 0xA6855419, 0x9C47D08F, 0xFB10D4B8 };
 
-    uchar block[64];
-    for (int i = 0; i < 64; i++) {
-        block[i] = (i < input_len) ? sha256_hash[i] : 0;
-    }
-    block[input_len] = 0x80;
+typedef struct { bignum x, y, z; } point_j;
 
-    uint bit_len = input_len * 8;
-    block[56] = (bit_len >> 0) & 0xff;
-    block[57] = (bit_len >> 8) & 0xff;
-    block[58] = (bit_len >> 16) & 0xff;
-    block[59] = (bit_len >> 24) & 0xff;
-
-    uint w[16];
-    for (int i = 0; i < 16; i++) {
-        w[i] = (block[i*4+0] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | (block[i*4+3]);
-    }
-
-    ripemd160_compress_local(h, w);
-
-    for (int i = 0; i < 5; i++) {
-        output[i*4+0] = (h[i] >> 0) & 0xff;
-        output[i*4+1] = (h[i] >> 8) & 0xff;
-        output[i*4+2] = (h[i] >> 16) & 0xff;
-        output[i*4+3] = (h[i] >> 24) & 0xff;
-    }
+void point_j_double(point_j *p) {
+    if (p->z.d[0]==0 && p->z.d[1]==0 && p->z.d[2]==0 && p->z.d[3]==0 && p->z.d[4]==0 && p->z.d[5]==0 && p->z.d[6]==0 && p->z.d[7]==0) return;
+    bignum s, m, t1, t2, x, y, z;
+    bn_mul_mont(&t1, &p->y, &p->y); bn_mul_mont(&s, &p->x, &t1); bn_mod_add(&s, &s, &s); bn_mod_add(&s, &s, &s);
+    bn_mul_mont(&t2, &p->x, &p->x); bn_mod_add(&m, &t2, &t2); bn_mod_add(&m, &m, &t2);
+    bn_mul_mont(&x, &m, &m); bn_mod_sub(&x, &x, &s); bn_mod_sub(&x, &x, &s);
+    bn_mul_mont(&z, &p->y, &p->z); bn_mod_add(&p->z, &z, &z);
+    bn_mod_sub(&t2, &s, &x); bn_mul_mont(&y, &m, &t2);
+    bn_mul_mont(&t1, &t1, &t1); bn_mod_add(&t1, &t1, &t1); bn_mod_add(&t1, &t1, &t1); bn_mod_add(&t1, &t1, &t1);
+    bn_mod_sub(&p->y, &y, &t1); p->x = x;
 }
 
-// Base58 encode - all private memory, returns length
+void point_j_add(point_j *p, point_j *q) {
+    if (q->z.d[0]==0 && q->z.d[1]==0 && q->z.d[2]==0 && q->z.d[3]==0 && q->z.d[4]==0 && q->z.d[5]==0 && q->z.d[6]==0 && q->z.d[7]==0) return;
+    if (p->z.d[0]==0 && p->z.d[1]==0 && p->z.d[2]==0 && p->z.d[3]==0 && p->z.d[4]==0 && p->z.d[5]==0 && p->z.d[6]==0 && p->z.d[7]==0) { *p = *q; return; }
+    bignum z1z1, z2z2, u1, u2, s1, s2, h, r, t1, t2;
+    bn_mul_mont(&z1z1, &p->z, &p->z); bn_mul_mont(&z2z2, &q->z, &q->z);
+    bn_mul_mont(&u1, &p->x, &z2z2); bn_mul_mont(&u2, &q->x, &z1z1);
+    bn_mul_mont(&t1, &p->z, &z1z1); bn_mul_mont(&s1, &p->y, &t1);
+    bn_mul_mont(&t2, &q->z, &z2z2); bn_mul_mont(&s2, &q->y, &t2);
+    if (bn_ucmp_ge(&u1, &u2) && bn_ucmp_ge(&u2, &u1)) { if (bn_ucmp_ge(&s1, &s2) && bn_ucmp_ge(&s2, &s1)) point_j_double(p); else { for(int i=0; i<8; i++) p->z.d[i]=0; } return; }
+    bn_mod_sub(&h, &u2, &u1); bn_mod_sub(&r, &s2, &s1);
+    bn_mul_mont(&t1, &p->z, &q->z); bn_mul_mont(&p->z, &t1, &h);
+    bn_mul_mont(&t1, &h, &h); bn_mul_mont(&t2, &t1, &h); bn_mul_mont(&u1, &u1, &t1);
+    bn_mul_mont(&p->x, &r, &r); bn_mod_sub(&p->x, &p->x, &t2); bn_mod_sub(&p->x, &p->x, &u1); bn_mod_sub(&p->x, &p->x, &u1);
+    bn_mod_sub(&t1, &u1, &p->x); bn_mul_mont(&p->y, &r, &t1); bn_mul_mont(&t1, &s1, &t2); bn_mod_sub(&p->y, &p->y, &t1);
+}
+
+void scalar_mult_g(point_j *res, bignum *k) {
+    point_j base, curr; for(int i=0; i<8; i++){ base.x.d[i]=Gx[i]; base.y.d[i]=Gy[i]; base.z.d[i]=0; curr.z.d[i]=0; }
+    base.z.d[0]=1; bignum rr; for(int i=0; i<8; i++) rr.d[i]=mont_rr[i];
+    bn_to_mont(&base.x, &base.x); bn_to_mont(&base.y, &base.y); bn_to_mont(&base.z, &base.z);
+    for (int i = 255; i >= 0; i--) {
+        point_j_double(&curr);
+        if ((k->d[i / 32] >> (i % 32)) & 1) point_j_add(&curr, &base);
+    }
+    *res = curr;
+}
+
+// Hashing Functions
+__constant uint sha2_init[] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+__constant uint sha2_k[] = { 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
+#define sha2_s0(a) (rotate(a, 30U) ^ rotate(a, 19U) ^ rotate(a, 10U))
+#define sha2_s1(a) (rotate(a, 26U) ^ rotate(a, 21U) ^ rotate(a, 7U))
+#define sha2_ch(a, b, c) (c ^ (a & (b ^ c)))
+#define sha2_ma(a, b, c) ((a & c) | (b & (a | c)))
+
+void sha256_block(uint *out, uint *in) {
+    uint s[8]; for(int i=0; i<8; i++) s[i]=out[i];
+    for(int i=0; i<64; i++) {
+        if(i>=16){ uint t1=in[(i+1)%16], t2=in[(i+14)%16]; in[i%16]+=in[(i+9)%16]+(rotate(t1,25U)^rotate(t1,14U)^(t1>>3))+(rotate(t2,15U)^rotate(t2,13U)^(t2>>10)); }
+        uint t1=s[7]+sha2_s1(s[4])+sha2_ch(s[4],s[5],s[6])+sha2_k[i]+in[i%16], t2=sha2_s0(s[0])+sha2_ma(s[0],s[1],s[2]);
+        s[7]=s[6]; s[6]=s[5]; s[5]=s[4]; s[4]=s[3]+t1; s[3]=s[2]; s[2]=s[1]; s[1]=s[0]; s[0]=t1+t2;
+    }
+    for(int i=0; i<8; i++) out[i]+=s[i];
+}
+
+__constant uint r_iv[]={0x67452301,0xefcdab89,0x98badcfe,0x10325476,0xc3d2e1f0}, r_k[]={0,0x5a827999,0x6ed9eba1,0x8f1bbcdc,0xa953fd4e}, r_kp[]={0x50a28be6,0x5c4dd124,0x6d703ef3,0x7a6d76e9,0};
+__constant uchar r_ws[]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13}, r_wsp[]={5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11}, r_rl[]={11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6}, r_rlp[]={8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
+uint rf(int i,uint x,uint y,uint z){if(i<16)return x^y^z;if(i<32)return(x&y)|(~x&z);if(i<48)return(x|~y)^z;if(i<64)return(x&z)|(y&~z);return x^(y|~z);}
+uint rfp(int i,uint x,uint y,uint z){if(i<16)return x^(y|~z);if(i<32)return(x&z)|(y&~z);if(i<48)return(x|~y)^z;if(i<64)return(x&y)|(~x&z);return x^y^z;}
+void ripemd160_block(uint *out, uint *in) {
+    uint v[10]; for(int i=0; i<5; i++) v[i]=v[i+5]=out[i];
+    for(int i=0; i<80; i++) {
+        uint t=rotate(v[0]+rf(i,v[1],v[2],v[3])+in[r_ws[i]]+r_k[i/16],(uint)r_rl[i])+v[4]; v[0]=v[4];v[4]=v[3];v[3]=rotate(v[2],10U);v[2]=v[1];v[1]=t;
+        t=rotate(v[5]+rfp(i,v[6],v[7],v[8])+in[r_wsp[i]]+r_kp[i/16],(uint)r_rlp[i])+v[9]; v[5]=v[9];v[9]=v[8];v[8]=rotate(v[7],10U);v[7]=v[6];v[6]=t;
+    }
+    uint t=out[1]+v[2]+v[8]; out[1]=out[2]+v[3]+v[9]; out[2]=out[3]+v[4]+v[5]; out[3]=out[4]+v[0]+v[6]; out[4]=v[0]+v[1]+v[7]; out[0]=t;
+}
+
+void hash160_compute(uchar* input, uint len, uchar* output) {
+    uint h[8]; for(int i=0; i<8; i++) h[i]=sha2_init[i];
+    uint w[16]={0}; for(int i=0; i<len; i++) ((uchar*)w)[i^3]=input[i]; ((uchar*)w)[len^3]=0x80; w[15]=len*8;
+    sha256_block(h,w); for(int i=0; i<8; i++) h[i]=bswap32(h[i]);
+    uint rh[5]; for(int i=0; i<5; i++) rh[i]=r_iv[i];
+    uint rw[16]={0}; for(int i=0; i<8; i++) rw[i]=h[i]; rw[8]=0x80; rw[14]=32*8;
+    ripemd160_block(rh,rw); for(int i=0; i<5; i++) { output[i*4]=rh[i]&0xff; output[i*4+1]=(rh[i]>>8)&0xff; output[i*4+2]=(rh[i]>>16)&0xff; output[i*4+3]=(rh[i]>>24)&0xff; }
+}
+
 int base58_encode_local(uchar* hash20, uchar version, char* output) {
-    // Convert hash160 to big-endian array (use uint64 for the value)
-    // Note: 20 bytes = 160 bits, won't fit in uint64. Use array approach.
-    uchar be_hash[20];
-    for (int i = 0; i < 20; i++) {
-        be_hash[i] = hash20[19 - i];  // Reverse to big-endian
-    }
-
-    // Count leading zeros in original hash (little-endian input)
-    int leading_zeros = 0;
-    for (int i = 0; i < 20; i++) {
-        if (hash20[i] == 0) leading_zeros++;
-        else break;
-    }
-
-    // Convert to base58 using repeated division
-    char temp[35] = {0};
-    int pos = 34;
-
-    // Use big-endian representation for division
-    int num_bytes = 21;  // version byte + 20 byte hash
-    uchar value[21];
-    value[0] = version;
-    for (int i = 0; i < 20; i++) {
-        value[i + 1] = be_hash[i];
-    }
-
-    // Division algorithm
-    int result_len = 0;
-    while (num_bytes > 1 || (num_bytes == 1 && value[0] > 0)) {
-        ulong remainder = 0;
-        int new_len = 0;
-        uchar new_value[21] = {0};
-
-        for (int i = 0; i < num_bytes; i++) {
-            ulong cur = remainder * 256 + value[i];
-            if (cur < 58) {
-                remainder = cur;
-            } else {
-                new_value[new_len++] = (uchar)(cur / 58);
-                remainder = cur % 58;
-            }
-        }
-
-        if (num_bytes > 0 && new_len == 0 && value[0] >= 58) {
-            new_value[0] = value[0] / 58;
-            remainder = value[0] % 58;
-            new_len = 1;
-        }
-
-        temp[pos--] = BASE58_CHARS[(uchar)remainder];
-        result_len++;
-
-        num_bytes = new_len;
-        for (int i = 0; i < num_bytes; i++) {
-            value[i] = new_value[i];
-        }
-    }
-
-    if (pos == 34) {
-        // Value was zero
-        temp[pos--] = BASE58_CHARS[0];
-        result_len++;
-    }
-
-    // Fill leading zeros
-    int out_idx = 0;
-    for (int i = 0; i < leading_zeros + 1; i++) {
-        output[out_idx++] = BASE58_CHARS[0];
-    }
-
-    // Copy rest in reverse order
-    for (int i = pos + 1; i < 35; i++) {
-        output[out_idx++] = temp[i];
-    }
-    output[out_idx] = '\0';
-
-    return out_idx;
+    uchar v[21]; v[0]=version; for(int i=0; i<20; i++) v[i+1]=hash20[i];
+    int z=0; while(z<21 && v[z]==0) z++;
+    char buf[40]; int p=38; buf[39]=0; int s=z;
+    while(s<21){ uint r=0; for(int i=s; i<21; i++){ uint t=(r<<8)+v[i]; v[i]=t/58; r=t%58; } buf[p--]=BASE58_CHARS[r]; while(s<21 && v[s]==0) s++; }
+    while(z--) buf[p--]=BASE58_CHARS[0];
+    int len=38-p; for(int i=0; i<len; i++) output[i]=buf[p+1+i]; output[len]=0; return len;
 }
 
-// Simple string comparison for prefix matching (private memory)
-bool starts_with_local(char* str, __global char* prefix, int prefix_len) {
-    for (int i = 0; i < prefix_len; i++) {
-        if (str[i] != prefix[i]) return false;
-    }
+// Bloom & Binary Search
+bool bloom_might_contain(__global uchar* f, uint s, uchar* h) {
+    uint bits = s*8; for(uint i=0; i<7; i++) { uint idx = ( ((uint*)h)[0] ^ (i*0x9e3779b9) ) % bits; if(!(f[idx/8] & (1<<(idx%8)))) return false; }
     return true;
 }
-
-// Generate private keys and optionally check against funded addresses
-__kernel void generate_and_check(
-    __global unsigned int* output_keys,
-    __global char* found_addresses,
-    __global int* found_count,
-    unsigned long seed,
-    unsigned int batch_size,
-    __global uchar* bloom_filter,
-    unsigned int filter_size,
-    __global char* prefix,
-    int prefix_len,
-    __global char* addresses_buffer,
-    unsigned int max_addresses
-) {
-    int gid = get_global_id(0);
-
-    if (gid >= batch_size)
-        return;
-
-    // Generate private key
-    unsigned int state = seed + gid;
-
-    // Generate 8 unsigned integers (256 bits) for private key
-    unsigned int key_words[8];
-    for (int i = 0; i < 8; i++) {
-        state = state * 1103515245 + 12345;
-        key_words[i] = state;
-        output_keys[gid * 8 + i] = state;
-    }
-
-    // Create public key (simplified - use hash of private key as "public key")
-    // In real implementation, this would be proper EC multiplication
-    uchar pubkey[33];
-    pubkey[0] = 0x02; // Compressed public key prefix
-
-    // Use first 32 bytes of key_words as public key x coordinate
-    for (int i = 0; i < 32; i++) {
-        pubkey[i + 1] = (key_words[i % 4] >> ((i % 4) * 8)) & 0xff;
-    }
-
-    // Generate P2PKH address (hash160 of public key)
-    uchar hash20[20];
-    hash160_compute(pubkey, 33, hash20);
-
-    // Base58 encode to get address
-    char address[35];
-    base58_encode_local(hash20, 0x00, address); // 0x00 for mainnet P2PKH
-
-    // Check prefix match if prefix provided
-    bool prefix_match = false;
-    if (prefix_len > 0) {
-        prefix_match = starts_with_local(address, prefix, prefix_len);
-    }
-
-    // Check bloom filter if provided (might be a funded address)
-    bool might_be_funded = false;
-    if (bloom_filter != NULL && filter_size > 0) {
-        uint3 addr_hash = (uint3)(hash20[0] | (hash20[1] << 8) | (hash20[2] << 16),
-                                   hash20[3] | (hash20[4] << 8) | (hash20[5] << 16),
-                                   hash20[6] | (hash20[7] << 8) | (hash20[8] << 16));
-        might_be_funded = bloom_might_contain(bloom_filter, filter_size, addr_hash);
-    }
-
-    // If might be funded or prefix match, we need to check more carefully
-    if (might_be_funded || prefix_match) {
-        // Write to results buffer
-        int idx = atomic_inc(found_count);
-        if (idx < max_addresses) {
-            // Store key words (8 * 4 = 32 bytes)
-            __global unsigned int* key_dest = (__global unsigned int*)(addresses_buffer + idx * 64);
-            for (int i = 0; i < 8; i++) {
-                key_dest[i] = key_words[i];
-            }
-            // Store address string after key
-            __global char* addr_dest = addresses_buffer + idx * 64 + 32;
-            for (int i = 0; i < 34 && address[i] != '\0'; i++) {
-                addr_dest[i] = address[i];
-            }
-            addr_dest[34] = '\0';
-        }
-    }
+int binary_search_hash160(__global uchar* a, uint n, uchar* t) {
+    int l=0, r=(int)n-1; while(l<=r){ int m=l+(r-l)/2; __global uchar* h=a+m*20; int c=0; for(int i=0; i<20; i++){ if(t[i]<h[i]){c=-1;break;} if(t[i]>h[i]){c=1;break;} } if(c==0) return 1; if(c<0) r=m-1; else l=m+1; }
+    return 0;
 }
 
-// Generate private keys only (simple version for compatibility)
-__kernel void generate_private_keys(
-    __global unsigned int* output_keys,
-    unsigned long seed,
-    unsigned int batch_size
-) {
-    int gid = get_global_id(0);
-
-    if (gid >= batch_size)
-        return;
-
-    // Simple but effective pseudo-random number generator
-    unsigned int state = seed + gid;
-
-    // Generate 8 unsigned integers (256 bits) for private key
-    for (int i = 0; i < 8; i++) {
-        // Linear congruential generator
-        state = state * 1103515245 + 12345;
-        output_keys[gid * 8 + i] = state;
-    }
+// Kernels
+__kernel void generate_addresses_full(__global uchar* found, __global int* count, unsigned long seed, uint batch, __global char* prefix, int prefix_len, uint max_addr, __global uchar* bloom, uint filter_size, uint check_balance) {
+    int gid = get_global_id(0); if (gid >= batch) return;
+    unsigned int st = (uint)seed + gid; bignum k; for (int i=0; i<8; i++) { st = st*1103515245+12345; k.d[i]=st; }
+    point_j res; scalar_mult_g(&res, &k);
+    if (res.z.d[0]==0 && res.z.d[1]==0 && res.z.d[2]==0 && res.z.d[3]==0 && res.z.d[4]==0 && res.z.d[5]==0 && res.z.d[6]==0 && res.z.d[7]==0) return;
+    bignum zinv, zinv2, x, y, tmp; bn_from_mont(&tmp, &res.z); bn_mod_inverse(&zinv, &tmp); bn_to_mont(&zinv, &zinv);
+    bn_mul_mont(&zinv2, &zinv, &zinv); bn_mul_mont(&tmp, &res.x, &zinv2); bn_from_mont(&x, &tmp);
+    bn_mul_mont(&zinv2, &zinv2, &zinv); bn_mul_mont(&tmp, &res.y, &zinv2); bn_from_mont(&y, &tmp);
+    uchar pubkey[33]; pubkey[0] = (y.d[0] & 1) ? 0x03 : 0x02;
+    for(int i=0; i<32; i++) pubkey[32-i] = (x.d[i/4] >> ((i%4)*8)) & 0xff;
+    uchar h160[20]; hash160_compute(pubkey, 33, h160);
+    char addr[64]; base58_encode_local(h160, 0, addr);
+    bool match = false; if(prefix_len > 0) { match=true; for(int i=0; i<prefix_len; i++) if(addr[i]!=prefix[i]) {match=false; break;} }
+    if(check_balance && bloom && filter_size > 0) { if(bloom_might_contain(bloom, filter_size, h160)) match=true; }
+    if(match) { int idx = atomic_inc(count); if(idx < (int)max_addr) { __global uchar* d = found + idx*128; for(int i=0; i<32; i++) d[i] = (k.d[i/4] >> ((i%4)*8)) & 0xff; for(int i=0; i<64; i++){ d[32+i]=addr[i]; if(addr[i]==0) break; } d[96]=(check_balance && bloom && bloom_might_contain(bloom, filter_size, h160))?1:0; } }
 }
 
-// Full GPU address generation - ALL operations on GPU
-// This kernel generates private keys, computes hash160, base58 encodes,
-// checks for prefix matches, and checks against bloom filter for funded addresses
-__kernel void generate_addresses_full(
-    __global uchar* found_addresses,  // Output: [key_bytes (32)][address_str (64)]
-    __global int* found_count,
-    unsigned long seed,
-    unsigned int batch_size,
-    __global char* prefix,
-    int prefix_len,
-    unsigned int max_addresses,
-    __global uchar* bloom_filter,    // Bloom filter for funded addresses
-    unsigned int filter_size,         // Bloom filter size in bytes
-    unsigned int check_balance        // Whether to check balance (1=yes, 0=no)
-) {
-    int gid = get_global_id(0);
-
-    if (gid >= batch_size)
-        return;
-
-    // Generate private key using LCG
-    unsigned int state = seed + gid;
-    unsigned int key_words[8];
-    for (int i = 0; i < 8; i++) {
-        state = state * 1103515245 + 12345;
-        key_words[i] = state;
-    }
-
-    // Create simplified public key from private key
-    // In a full implementation, this would be proper EC multiplication
-    uchar pubkey[33];
-    pubkey[0] = 0x02; // Compressed public key prefix
-    for (int i = 0; i < 32; i++) {
-        pubkey[i + 1] = (key_words[i % 4] >> ((i % 4) * 8)) & 0xff;
-    }
-
-    // Compute hash160 (SHA256 + RIPEMD160)
-    uchar hash20[20];
-    hash160_compute(pubkey, 33, hash20);
-
-    // Base58 encode to get P2PKH address
-    char address[64];  // Extra space for safety
-    base58_encode_local(hash20, 0x00, address);
-
-    // Check for prefix match
-    bool prefix_match = false;
-    if (prefix_len > 0) {
-        prefix_match = true;
-        for (int i = 0; i < prefix_len; i++) {
-            if (address[i] != prefix[i]) {
-                prefix_match = false;
-                break;
-            }
-        }
-    }
-
-    // Check bloom filter for funded address match
-    bool might_be_funded = false;
-    if (check_balance && bloom_filter != NULL && filter_size > 0) {
-        uint3 addr_hash = (uint3)(hash20[0] | (hash20[1] << 8) | (hash20[2] << 16),
-                                   hash20[3] | (hash20[4] << 8) | (hash20[5] << 16),
-                                   hash20[6] | (hash20[7] << 8) | (hash20[8] << 16));
-        might_be_funded = bloom_might_contain(bloom_filter, filter_size, addr_hash);
-    }
-
-    // Match if: prefix matches OR might be funded (bloom filter)
-    bool match = prefix_match || might_be_funded;
-
-    // If match, write to results
-    if (match) {
-        int idx = atomic_inc(found_count);
-        if (idx < (int)max_addresses) {
-            __global uchar* dest = found_addresses + idx * 128;
-
-            // Store 32-byte key
-            for (int i = 0; i < 8; i++) {
-                dest[i*4 + 0] = (key_words[i] >> 0) & 0xff;
-                dest[i*4 + 1] = (key_words[i] >> 8) & 0xff;
-                dest[i*4 + 2] = (key_words[i] >> 16) & 0xff;
-                dest[i*4 + 3] = (key_words[i] >> 24) & 0xff;
-            }
-
-            // Store null-terminated address string (offset 32)
-            __global char* addr_dest = (__global char*)(dest + 32);
-            for (int i = 0; i < 64; i++) {
-                addr_dest[i] = address[i];
-                if (address[i] == '\0') break;
-            }
-
-            // Store bloom filter match flag (offset 96)
-            dest[96] = might_be_funded ? 1 : 0;
-        }
-    }
+__kernel void generate_addresses_full_exact(__global uchar* found, __global int* count, unsigned long seed, uint batch, __global char* prefix, int prefix_len, uint max_addr, __global uchar* addr_list, uint list_count, uint check_addr) {
+    int gid = get_global_id(0); if (gid >= batch) return;
+    unsigned int st = (uint)seed + gid; bignum k; for (int i=0; i<8; i++) { st = st*1103515245+12345; k.d[i]=st; }
+    point_j res; scalar_mult_g(&res, &k);
+    if (res.z.d[0]==0 && res.z.d[1]==0 && res.z.d[2]==0 && res.z.d[3]==0 && res.z.d[4]==0 && res.z.d[5]==0 && res.z.d[6]==0 && res.z.d[7]==0) return;
+    bignum zinv, zinv2, x, y, tmp; bn_from_mont(&tmp, &res.z); bn_mod_inverse(&zinv, &tmp); bn_to_mont(&zinv, &zinv);
+    bn_mul_mont(&zinv2, &zinv, &zinv); bn_mul_mont(&tmp, &res.x, &zinv2); bn_from_mont(&x, &tmp);
+    bn_mul_mont(&zinv2, &zinv2, &zinv); bn_mul_mont(&tmp, &res.y, &zinv2); bn_from_mont(&y, &tmp);
+    uchar pubkey[33]; pubkey[0] = (y.d[0] & 1) ? 0x03 : 0x02;
+    for(int i=0; i<32; i++) pubkey[32-i] = (x.d[i/4] >> ((i%4)*8)) & 0xff;
+    uchar h160[20]; hash160_compute(pubkey, 33, h160);
+    char addr[64]; base58_encode_local(h160, 0, addr);
+    bool match = false; if(prefix_len > 0) { match=true; for(int i=0; i<prefix_len; i++) if(addr[i]!=prefix[i]) {match=false; break;} }
+    bool funded = (check_addr && addr_list && list_count > 0 && binary_search_hash160(addr_list, list_count, h160));
+    if(match || funded) { int idx = atomic_inc(count); if(idx < (int)max_addr) { __global uchar* d = found + idx*128; for(int i=0; i<32; i++) d[i] = (k.d[i/4] >> ((i%4)*8)) & 0xff; for(int i=0; i<64; i++){ d[32+i]=addr[i]; if(addr[i]==0) break; } d[96]=funded?1:0; } }
 }
 
-// Binary search for hash160 in sorted array
-// Returns: 1 if found, 0 if not found
-int binary_search_hash160(__global uchar* sorted_array, uint num_addresses, uchar* target_hash160) {
-    int left = 0;
-    int right = (int)num_addresses - 1;
-    
-    while (left <= right) {
-        int mid = left + (right - left) / 2;
-        __global uchar* mid_hash = sorted_array + mid * 20;
-        
-        // Compare the 20-byte hash160 values
-        int cmp = 0;
-        for (int i = 0; i < 20; i++) {
-            if (target_hash160[i] < mid_hash[i]) {
-                cmp = -1;
-                break;
-            } else if (target_hash160[i] > mid_hash[i]) {
-                cmp = 1;
-                break;
-            }
-        }
-        
-        if (cmp == 0) {
-            return 1;  // Found
-        } else if (cmp < 0) {
-            right = mid - 1;
-        } else {
-            left = mid + 1;
-        }
-    }
-    
-    return 0;  // Not found
+__kernel void generate_private_keys(__global uint* out, unsigned long seed, uint batch) {
+    int gid = get_global_id(0); if (gid >= batch) return;
+    unsigned int st = (uint)seed + gid; for (int i=0; i<8; i++) { st = st*1103515245+12345; out[gid*8+i]=st; }
 }
 
-// Check if address hash160 is in GPU-resident address list
-// This kernel performs exact address matching with NO false positives
-__kernel void check_address_in_gpu_list(
-    __global uchar* hash160_list,      // Sorted array of hash160 values (20 bytes each)
-    unsigned int num_addresses,        // Number of addresses in the list
-    __global uchar* test_hash160,      // Hash160 values to test (20 bytes each)
-    __global int* match_results,       // Output: 1 if match, 0 if no match
-    unsigned int num_tests             // Number of hash160 values to test
-) {
-    int gid = get_global_id(0);
-    
-    if (gid >= num_tests)
-        return;
-    
-    // Get the hash160 to test
-    uchar target_hash160[20];
-    for (int i = 0; i < 20; i++) {
-        target_hash160[i] = test_hash160[gid * 20 + i];
-    }
-    
-    // Binary search in sorted array
-    int found = binary_search_hash160(hash160_list, num_addresses, target_hash160);
-    match_results[gid] = found;
-}
-
-// Full GPU address generation with exact address list checking (NO bloom filter)
-// This kernel generates private keys, computes hash160, base58 encodes,
-// checks for prefix matches, and checks against exact GPU-resident address list
-__kernel void generate_addresses_full_exact(
-    __global uchar* found_addresses,     // Output: [key_bytes (32)][address_str (64)]
-    __global int* found_count,
-    unsigned long seed,
-    unsigned int batch_size,
-    __global char* prefix,
-    int prefix_len,
-    unsigned int max_addresses,
-    __global uchar* address_list,        // Sorted array of hash160 values
-    unsigned int address_list_count,     // Number of addresses in list
-    unsigned int check_addresses         // Whether to check address list (1=yes, 0=no)
-) {
-    int gid = get_global_id(0);
-    
-    if (gid >= batch_size)
-        return;
-    
-    // Generate private key using LCG
-    unsigned int state = seed + gid;
-    unsigned int key_words[8];
-    for (int i = 0; i < 8; i++) {
-        state = state * 1103515245 + 12345;
-        key_words[i] = state;
-    }
-    
-    // Create simplified public key from private key
-    uchar pubkey[33];
-    pubkey[0] = 0x02; // Compressed public key prefix
-    for (int i = 0; i < 32; i++) {
-        pubkey[i + 1] = (key_words[i % 4] >> ((i % 4) * 8)) & 0xff;
-    }
-    
-    // Compute hash160 (SHA256 + RIPEMD160)
-    uchar hash20[20];
-    hash160_compute(pubkey, 33, hash20);
-    
-    // Base58 encode to get P2PKH address
-    char address[64];
-    base58_encode_local(hash20, 0x00, address);
-    
-    // Check for prefix match
-    bool prefix_match = false;
-    if (prefix_len > 0) {
-        prefix_match = true;
-        for (int i = 0; i < prefix_len; i++) {
-            if (address[i] != prefix[i]) {
-                prefix_match = false;
-                break;
-            }
-        }
-    }
-    
-    // Check exact address list for funded address match (NO false positives)
-    bool is_funded = false;
-    if (check_addresses && address_list != NULL && address_list_count > 0) {
-        is_funded = binary_search_hash160(address_list, address_list_count, hash20);
-    }
-    
-    // Match if: prefix matches OR is in funded address list
-    bool match = prefix_match || is_funded;
-    
-    // If match, write to results
-    if (match) {
-        int idx = atomic_inc(found_count);
-        if (idx < (int)max_addresses) {
-            __global uchar* dest = found_addresses + idx * 128;
-            
-            // Store 32-byte key
-            for (int i = 0; i < 8; i++) {
-                dest[i*4 + 0] = (key_words[i] >> 0) & 0xff;
-                dest[i*4 + 1] = (key_words[i] >> 8) & 0xff;
-                dest[i*4 + 2] = (key_words[i] >> 16) & 0xff;
-                dest[i*4 + 3] = (key_words[i] >> 24) & 0xff;
-            }
-            
-            // Store null-terminated address string (offset 32)
-            __global char* addr_dest = (__global char*)(dest + 32);
-            for (int i = 0; i < 64; i++) {
-                addr_dest[i] = address[i];
-                if (address[i] == '\0') break;
-            }
-            
-            // Store funded flag (offset 96) - 1 if in address list, 0 otherwise
-            dest[96] = is_funded ? 1 : 0;
-        }
-    }
+__kernel void generate_and_check(__global uint* keys, __global char* found_addr, __global int* count, unsigned long seed, uint batch, __global uchar* bloom, uint filter_size, __global char* prefix, int prefix_len, __global char* addr_buf, uint max_addr) {
+    int gid = get_global_id(0); if (gid >= batch) return;
+    unsigned int st = (uint)seed + gid; bignum k; for (int i=0; i<8; i++) { st = st*1103515245+12345; k.d[i]=st; keys[gid*8+i]=st; }
+    point_j res; scalar_mult_g(&res, &k);
+    if (res.z.d[0]==0 && res.z.d[1]==0 && res.z.d[2]==0 && res.z.d[3]==0 && res.z.d[4]==0 && res.z.d[5]==0 && res.z.d[6]==0 && res.z.d[7]==0) return;
+    bignum zinv, zinv2, x, y, tmp; bn_from_mont(&tmp, &res.z); bn_mod_inverse(&zinv, &tmp); bn_to_mont(&zinv, &zinv);
+    bn_mul_mont(&zinv2, &zinv, &zinv); bn_mul_mont(&tmp, &res.x, &zinv2); bn_from_mont(&x, &tmp);
+    bn_mul_mont(&zinv2, &zinv2, &zinv); bn_mul_mont(&tmp, &res.y, &zinv2); bn_from_mont(&y, &tmp);
+    uchar pubkey[33]; pubkey[0] = (y.d[0] & 1) ? 0x03 : 0x02;
+    for(int i=0; i<32; i++) pubkey[32-i] = (x.d[i/4] >> ((i%4)*8)) & 0xff;
+    uchar h160[20]; hash160_compute(pubkey, 33, h160);
+    char addr[64]; base58_encode_local(h160, 0, addr);
+    bool prefix_match = false; if(prefix_len > 0) { prefix_match=true; for(int i=0; i<prefix_len; i++) if(addr[i]!=prefix[i]) {prefix_match=false; break;} }
+    bool might_be_funded = (bloom && filter_size > 0 && bloom_might_contain(bloom, filter_size, h160));
+    if(prefix_match || might_be_funded) { int idx = atomic_inc(count); if(idx < (int)max_addr) { __global uint* kd = (__global uint*)(addr_buf + idx*64); for(int i=0; i<8; i++) kd[i]=k.d[i]; __global char* ad = addr_buf + idx*64 + 32; for(int i=0; i<31; i++){ ad[i]=addr[i]; if(addr[i]==0) break; } ad[31]=0; } }
 }

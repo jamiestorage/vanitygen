@@ -253,9 +253,9 @@ class VanityGenGUI(QMainWindow):
         gpu_settings_layout.addLayout(device_layout)
 
         # GPU Only mode checkbox
-        self.gpu_only_check = QCheckBox("GPU Only Mode (EXPERIMENTAL - POTENTIALLY INVALID)")
-        self.gpu_only_check.setToolTip("WARNING: GPU-only mode currently uses simplified EC operations.\nFound matches are verified on CPU, but most GPU matches will be false positives.\nUse GPU+CPU mode for reliable generation.")
-        self.gpu_only_check.setStyleSheet("QCheckBox { color: #cc0000; }")
+        self.gpu_only_check = QCheckBox("GPU Only Mode (Full GPU Acceleration)")
+        self.gpu_only_check.setToolTip("When enabled, ALL operations (key generation, EC math, address generation, matching) happen on GPU.\nThis maximizes performance and minimizes CPU load.")
+        self.gpu_only_check.setStyleSheet("")
         gpu_settings_layout.addWidget(self.gpu_only_check)
 
         self.gpu_settings_widget.setLayout(gpu_settings_layout)
