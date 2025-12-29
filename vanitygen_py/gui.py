@@ -119,17 +119,32 @@ class GeneratorThread(QThread):
             elapsed = time.time() - start_time
             speed = total_keys / elapsed if elapsed > 0 else 0
             self.stats_updated.emit(total_keys, speed)
-            
+
             # Check results
-            while not self.generator.result_queue.empty():
-                addr, wif, pubkey = self.generator.result_queue.get()
-                balance, is_in_funded_list = self.balance_checker.check_balance_and_membership(addr)
-                self.address_found.emit(addr, wif, pubkey, balance, is_in_funded_list)
-                if balance > 0 and not self.auto_resume:
-                    # Pause if funded address found (as per requirements)
-                    self.running = False
-                    self.generator.stop()
-                    break
+            try:
+                while not self.generator.result_queue.empty():
+                    result = self.generator.result_queue.get_nowait()
+                    # Handle both 3-tuple and 4-tuple results for backward compatibility
+                    if len(result) == 3:
+                        addr, wif, pubkey = result
+                    elif len(result) == 4:
+                        addr, wif, pubkey, _ = result  # Ignore balance if already computed
+                    else:
+                        print(f"Unexpected result format: {result}")
+                        continue
+
+                    # Check balance
+                    balance, is_in_funded_list = self.balance_checker.check_balance_and_membership(addr)
+                    self.address_found.emit(addr, wif, pubkey, balance, is_in_funded_list)
+                    if balance > 0 and not self.auto_resume:
+                        # Pause if funded address found (as per requirements)
+                        self.running = False
+                        self.generator.stop()
+                        break
+            except Exception as e:
+                print(f"Error processing results: {e}")
+                import traceback
+                traceback.print_exc()
 
     def stop(self):
         self.running = False

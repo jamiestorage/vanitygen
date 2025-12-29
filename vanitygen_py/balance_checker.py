@@ -957,9 +957,18 @@ class BalanceChecker:
 
         # Calculate filter size
         num_items = len(addresses)
+
+        # Sanity check: limit bloom filter size to prevent memory exhaustion
+        # For large address sets, cap at 1GB (8 billion bits) to prevent system lockup
+        max_byte_size = 1024 * 1024 * 1024  # 1GB max
         num_bits = num_items * bits_per_item
-        # Round up to byte boundary
         byte_size = (num_bits + 7) // 8
+
+        if byte_size > max_byte_size:
+            print(f"WARNING: Bloom filter would be too large ({byte_size / (1024**3):.2f} GB)")
+            print(f"Reducing bits_per_item from {bits_per_item} to {max_byte_size * 8 // num_items}")
+            num_bits = max_byte_size * 8
+            byte_size = max_byte_size
 
         # Initialize bloom filter
         bloom_filter = bytearray(byte_size)
@@ -1019,6 +1028,16 @@ class BalanceChecker:
         if not addresses:
             return None
 
+        # Sanity check: limit buffer size to prevent memory exhaustion
+        buffer_size = 64 * len(addresses)
+        max_buffer_size = 512 * 1024 * 1024  # 512MB max for address buffer
+
+        if buffer_size > max_buffer_size:
+            print(f"WARNING: Address buffer would be too large ({buffer_size / (1024**2):.2f} MB)")
+            print(f"Limiting to first {max_buffer_size // 64} addresses")
+            addresses = addresses[:max_buffer_size // 64]
+            buffer_size = 64 * len(addresses)
+
         # Import hash160 for computing address hashes
         try:
             from .crypto_utils import hash160 as py_hash160
@@ -1026,7 +1045,7 @@ class BalanceChecker:
             from crypto_utils import hash160 as py_hash160
 
         # Build buffer
-        buffer = bytearray(64 * len(addresses))
+        buffer = bytearray(buffer_size)
         for i, addr in enumerate(addresses):
             offset = i * 64
 

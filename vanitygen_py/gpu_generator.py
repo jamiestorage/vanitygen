@@ -339,6 +339,9 @@ class GPUGenerator:
                 # Create output buffers
                 output_keys = np.zeros(self.batch_size * 8, dtype=np.uint32)
 
+                # Create GPU buffer for output keys
+                output_keys_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, output_keys.nbytes)
+
                 # Ensure buffers are on GPU
                 results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
                 found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
@@ -350,7 +353,7 @@ class GPUGenerator:
                 # Execute the combined kernel
                 self.kernel_check(
                     self.queue, (self.batch_size,), None,
-                    output_keys,  # output_keys
+                    output_keys_buf,  # output_keys
                     results_buf,  # found_addresses (not used directly)
                     found_count_buf,  # found_count
                     np.uint64(self.rng_seed),  # seed
@@ -372,6 +375,11 @@ class GPUGenerator:
 
                 # Update seed
                 self.rng_seed += self.batch_size
+
+                # Clean up GPU buffers to prevent memory leak
+                output_keys_buf.release()
+                results_buf.release()
+                found_count_buf.release()
 
                 # Process found results
                 num_found = found_count[0]
@@ -404,8 +412,7 @@ class GPUGenerator:
                             self.result_queue.put((
                                 address,
                                 key.get_wif(),
-                                key.get_public_key().hex(),
-                                balance
+                                key.get_public_key().hex()
                             ))
                             print(f"*** FUNDED ADDRESS FOUND! ***")
                             print(f"Address: {address}")
@@ -417,8 +424,7 @@ class GPUGenerator:
                         self.result_queue.put((
                             address,
                             key.get_wif(),
-                            key.get_public_key().hex(),
-                            balance if self.balance_checker else 0
+                            key.get_public_key().hex()
                         ))
 
                 # Update stats
@@ -479,6 +485,9 @@ class GPUGenerator:
         mf = cl.mem_flags
         gpu_prefix_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=prefix_buffer)
 
+        # Store prefix buffer for cleanup
+        self.gpu_prefix_buffer = gpu_prefix_buffer
+
         # Set up bloom filter for balance checking
         check_balance = 0
         gpu_bloom_filter = None
@@ -490,13 +499,26 @@ class GPUGenerator:
             if bloom_data is not None:
                 check_balance = 1
                 bloom_filter_size = len(bloom_data)
-                bloom_buffer = np.frombuffer(bloom_data, dtype=np.uint8)
+                # Use np.array instead of np.frombuffer to create a copy and avoid keeping reference
+                bloom_buffer = np.array(bloom_data, dtype=np.uint8)
                 gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bloom_buffer)
+                # Store for cleanup
+                self.temp_bloom_buffer = gpu_bloom_filter
                 print(f"Bloom filter: {bloom_filter_size} bytes ({bloom_size} bits)")
+                # Clear the buffer reference to free memory
+                del bloom_buffer
+            else:
+                print("Bloom filter creation failed, proceeding without balance checking")
         else:
-            # Create empty buffer for kernel consistency
+            print("No balance checker loaded, proceeding without balance checking")
+
+        # Ensure we have a valid buffer for kernel (even if empty)
+        if gpu_bloom_filter is None:
             dummy_buffer = np.zeros(1, dtype=np.uint8)
             gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=dummy_buffer)
+            # Store for cleanup
+            self.temp_bloom_buffer = gpu_bloom_filter
+            del dummy_buffer
 
         while not self.stop_event.is_set():
             # Check if paused
@@ -507,6 +529,8 @@ class GPUGenerator:
             loop_start = time.time()
 
             try:
+                mf = cl.mem_flags
+
                 # Create output buffer for results
                 results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
                 found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
@@ -540,48 +564,61 @@ class GPUGenerator:
                 # Update seed
                 self.rng_seed += self.batch_size
 
+                # Clean up GPU buffers to prevent memory leak
+                results_buf.release()
+                found_count_buf.release()
+
+                # Update stats BEFORE processing results to ensure counter increments even on errors
+                with self.stats_lock:
+                    self.stats_counter += self.batch_size
+
                 # Process found results
                 # First pass: check bloom filter matches (high priority)
                 num_found = found_count[0]
 
                 # Collect all results first
                 results = []
-                for i in range(min(num_found, max_results)):
-                    offset = i * 128
+                try:
+                    for i in range(min(num_found, max_results)):
+                        offset = i * 128
 
-                    # Extract key words (first 32 bytes = 8 uint32)
-                    key_words = []
-                    for j in range(8):
-                        word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
-                        key_words.append(word)
-                    key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
+                        # Extract key words (first 32 bytes = 8 uint32)
+                        key_words = []
+                        for j in range(8):
+                            word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
+                            key_words.append(word)
+                        key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
 
-                    # Extract address string (after key, null-terminated)
-                    addr_start = offset + 32
-                    addr_end = offset + 96  # Allow up to 64 chars for address
-                    addr = ''
-                    for k in range(addr_start, addr_end):
-                        if results_buffer[k] == 0:
-                            break
-                        addr += chr(results_buffer[k])
+                        # Extract address string (after key, null-terminated)
+                        addr_start = offset + 32
+                        addr_end = offset + 96  # Allow up to 64 chars for address
+                        addr = ''
+                        for k in range(addr_start, addr_end):
+                            if results_buffer[k] == 0:
+                                break
+                            addr += chr(results_buffer[k])
 
-                    # Check if bloom filter matched (byte 96)
-                    bloom_match = results_buffer[offset + 96] == 1
+                        # Check if bloom filter matched (byte 96)
+                        bloom_match = results_buffer[offset + 96] == 1
 
-                    results.append((addr, key_bytes, bloom_match))
+                        results.append((addr, key_bytes, bloom_match))
 
-                # Sort results: bloom filter matches first
-                results.sort(key=lambda x: not x[2])
+                    # Sort results: bloom filter matches first
+                    results.sort(key=lambda x: not x[2])
 
-                # Process results
-                for addr, key_bytes, bloom_match in results:
-                    if addr:
-                        # Report result (always 3 elements, balance checked by GeneratorThread)
-                        self.result_queue.put((addr, '', ''))
-
-                # Update stats
-                with self.stats_lock:
-                    self.stats_counter += self.batch_size
+                    # Process results
+                    for addr, key_bytes, bloom_match in results:
+                        if addr:
+                            # Generate WIF and public key from key_bytes
+                            key = BitcoinKey(key_bytes)
+                            wif = key.get_wif()
+                            pubkey = key.get_public_key().hex()
+                            # Report result with full key information
+                            self.result_queue.put((addr, wif, pubkey))
+                except Exception as e:
+                    print(f"Error processing GPU results: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             except Exception as e:
                 print(f"Error in GPU-only mode: {e}")
@@ -596,6 +633,22 @@ class GPUGenerator:
                 sleep_time = work_time * (1.0 / duty - 1.0)
                 if sleep_time > 0:
                     self.stop_event.wait(timeout=sleep_time)
+
+        # Clean up temporary bloom filter buffer when loop exits
+        if hasattr(self, 'temp_bloom_buffer') and self.temp_bloom_buffer is not None:
+            try:
+                self.temp_bloom_buffer.release()
+            except Exception:
+                pass
+            self.temp_bloom_buffer = None
+
+        # Clean up prefix buffer
+        if hasattr(self, 'gpu_prefix_buffer') and self.gpu_prefix_buffer is not None:
+            try:
+                self.gpu_prefix_buffer.release()
+            except Exception:
+                pass
+            self.gpu_prefix_buffer = None
 
     def _search_loop(self):
         """Main search loop using GPU for key generation and multiprocessing for CPU processing"""
@@ -763,12 +816,12 @@ class GPUGenerator:
 
     def _cleanup_gpu_buffers(self):
         """Clean up all GPU buffers"""
-        for attr_name in ['gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer']:
+        for attr_name in ['gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer', 'gpu_prefix_buffer', 'temp_bloom_buffer']:
             if hasattr(self, attr_name) and getattr(self, attr_name) is not None:
                 try:
                     getattr(self, attr_name).release()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Error releasing {attr_name}: {e}")
                 setattr(self, attr_name, None)
 
     def pause(self):
