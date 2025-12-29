@@ -290,7 +290,6 @@ class GPUGenerator:
             # Compile the exact address matching kernel for GPU-only mode with direct address list
             try:
                 self.kernel_full_exact = self.program.generate_addresses_full_exact
-                self.kernel_check_address = self.program.check_address_in_gpu_list
                 print("Exact address matching kernel compiled (GPU-only mode with address list)")
             except Exception as e:
                 print(f"Note: Exact address matching kernel not available: {e}")
