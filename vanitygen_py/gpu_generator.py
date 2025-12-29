@@ -581,6 +581,9 @@ class GPUGenerator:
         print("[DEBUG] _search_loop_gpu_only() - Starting GPU-only search loop...")
         print(f"[DEBUG] _search_loop_gpu_only() - Batch size: {self.batch_size}")
         print(f"[DEBUG] _search_loop_gpu_only() - Prefix: '{self.prefix}'")
+        print(f"[DEBUG] _search_loop_gpu_only() - Balance checker loaded: {self.balance_checker is not None and self.balance_checker.is_loaded}")
+        print(f"[DEBUG] _search_loop_gpu_only() - GPU bloom filter available: {self.gpu_bloom_filter is not None}")
+        print(f"[DEBUG] _search_loop_gpu_only() - GPU address list buffer available: {self.gpu_address_list_buffer is not None}")
         
         # Determine which kernel to use based on available resources
         use_exact_matching = (
@@ -599,15 +602,17 @@ class GPUGenerator:
             self._search_loop_gpu_only_exact()
             return
         
-        # Fall back to bloom filter or no balance checking
+        # Check if we should use balance checking with bloom filter
+        if self.balance_checker and self.balance_checker.is_loaded and self.gpu_bloom_filter is not None:
+            print("[DEBUG] _search_loop_gpu_only() - Balance checker loaded, using GPU balance checking mode")
+            self._search_loop_with_balance_check()
+            return
+        
+        # Fall back to GPU-only mode or CPU-assisted mode
         if self.kernel_full is None:
             print("[DEBUG] _search_loop_gpu_only() - WARNING: Full GPU kernel not available, falling back to CPU-assisted mode")
-            if self.balance_checker and self.gpu_bloom_filter is not None:
-                print("[DEBUG] _search_loop_gpu_only() - Using balance checking mode")
-                self._search_loop_with_balance_check()
-            else:
-                print("[DEBUG] _search_loop_gpu_only() - Using CPU fallback mode")
-                self._search_loop()
+            print("[DEBUG] _search_loop_gpu_only() - Using CPU fallback mode")
+            self._search_loop()
             return
 
         print("[DEBUG] _search_loop_gpu_only() - Allocating result buffers...")
