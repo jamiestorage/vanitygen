@@ -1,6 +1,6 @@
 /*
  * OpenCL kernel for GPU-accelerated vanity address generation with balance checking
- * 
+ *
  * This kernel provides:
  * - Random private key generation
  * - SHA256 and RIPEMD160 hash computation (hash160)
@@ -61,8 +61,6 @@ uint F(int j, uint x, uint y, uint z) {
 uint K_F(int j) { return RK[(j < 20 ? 0 : (j < 40 ? 1 : (j < 60 ? 2 : 3)))]; }
 uint K_K(int j) { return RKK[(j < 20 ? 0 : (j < 40 ? 1 : (j < 60 ? 2 : 3)))]; }
 
-uint RL(uint x, int n) { return (x << n) | (x >> (32 - n)); }
-
 // Simple hash function for bloom filter
 uint bloom_hash(uint3 data, uint seed, uint m) {
     uint h = data.x ^ (seed * 0x9e3779b9);
@@ -84,16 +82,68 @@ bool bloom_might_contain(__global uchar* bloom_filter, uint filter_size, uint3 a
     return true;
 }
 
-// RIPEMD160 implementation
-void ripemd160_compress(__global uint* h, __global uint* block) {
+// Compute SHA256 - all private memory
+void sha256_compute(uchar* input, uint input_len, uchar* output) {
+    uint h[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+
+    uchar block[64];
+    for (int i = 0; i < 64; i++) {
+        block[i] = (i < input_len) ? input[i] : 0;
+    }
+    block[input_len] = 0x80;
+
+    uint bit_len = input_len * 8;
+    block[56] = (bit_len >> 0) & 0xff;
+    block[57] = (bit_len >> 8) & 0xff;
+    block[58] = (bit_len >> 16) & 0xff;
+    block[59] = (bit_len >> 24) & 0xff;
+
+    uint w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = (block[i*4+0] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | (block[i*4+3]);
+    }
+    for (int i = 16; i < 64; i++) {
+        w[i] = gamma1(w[i-2]) + gamma0(w[i-15]) + w[i-7] + w[i-16];
+    }
+
+    uint a = h[0], b = h[1], c = h[2], d = h[3];
+    uint e = h[4], f = h[5], g = h[6], h7 = h[7];
+
+    for (int i = 0; i < 64; i++) {
+        uint S0 = sigma0(a), S1 = sigma1(e);
+        uint maj = (a & b) ^ (a & c) ^ (b & c);
+        uint tr1 = h7 + sigma1(e) + ch(e, f, g) + K[i] + w[i];
+        uint tr2 = S0 + maj;
+
+        h7 = g; g = f; f = e;
+        e = d + tr1;
+        d = c; c = b; b = a;
+        a = tr1 + tr2;
+    }
+
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += h7;
+
+    for (int i = 0; i < 8; i++) {
+        output[i*4+0] = (h[i] >> 24) & 0xff;
+        output[i*4+1] = (h[i] >> 16) & 0xff;
+        output[i*4+2] = (h[i] >> 8) & 0xff;
+        output[i*4+3] = h[i] & 0xff;
+    }
+}
+
+// RIPEMD160 compress - all private memory
+void ripemd160_compress_local(uint* h, uint* block) {
     uint a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
     uint aa = a, bb = b, cc = c, dd = d, ee = e;
     uint X[16];
-    
+
     for (int i = 0; i < 16; i++)
         X[i] = block[i];
-    
-    // Parallel lines
+
     for (int j = 0; j < 80; j++) {
         uint T;
         if (j < 16) {
@@ -107,16 +157,16 @@ void ripemd160_compress(__global uint* h, __global uint* block) {
         } else {
             T = F(j - 64, b, c, d);
         }
-        
+
         T = a + T + X[(j % 16) ^ ((j + 2) % 16)] + K_F(j);
         T = rotl(T, 5) + e;
         a = e; e = d; d = rotl(c, 10); c = b; b = T;
-        
+
         T = aa + F(79 - j, bb, cc, dd) + X[(j % 16) ^ ((j + 8) % 16)] + K_K(j);
         T = rotl(T, 5) + ee;
         aa = ee; ee = dd; dd = rotl(cc, 10); cc = bb; bb = T;
     }
-    
+
     uint tmp = h[1] + c + dd;
     h[1] = h[2] + d + ee;
     h[2] = h[3] + e + aa;
@@ -125,92 +175,34 @@ void ripemd160_compress(__global uint* h, __global uint* block) {
     h[0] = tmp;
 }
 
-// Compute SHA256
-void sha256_single(__global uchar* output, __global const uchar* input, uint input_len) {
-    uint h[8] = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-    };
-    
-    // Pad input to 64-byte blocks
-    uchar block[64];
-    for (int i = 0; i < 64; i++) {
-        block[i] = (i < input_len) ? input[i] : 0;
-    }
-    block[input_len] = 0x80;
-    
-    // Set message length in bits
-    uint bit_len = input_len * 8;
-    block[56] = (bit_len >> 0) & 0xff;
-    block[57] = (bit_len >> 8) & 0xff;
-    block[58] = (bit_len >> 16) & 0xff;
-    block[59] = (bit_len >> 24) & 0xff;
-    
-    // Last 4 bytes already zero (big-endian length)
-    
-    // Process block
-    uint w[64];
-    for (int i = 0; i < 16; i++) {
-        w[i] = (block[i*4+0] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | (block[i*4+3]);
-    }
-    for (int i = 16; i < 64; i++) {
-        w[i] = gamma1(w[i-2]) + gamma0(w[i-15]) + w[i-7] + w[i-16];
-    }
-    
-    uint a = h[0], b = h[1], c = h[2], d = h[3];
-    uint e = h[4], f = h[5], g = h[6], h_ = h[7];
-    
-    for (int i = 0; i < 64; i++) {
-        uint S0 = sigma0(a), S1 = sigma1(e);
-        uint maj = (a & b) ^ (a & c) ^ (b & c);
-        uint tr1 = h_ + sigma1(e) + ch(e, f, g) + K[i] + w[i];
-        uint tr2 = S0 + maj;
-        
-        h_ = g; g = f; f = e;
-        e = d + tr1;
-        d = c; c = b; b = a;
-        a = tr1 + tr2;
-    }
-    
-    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-    h[4] += e; h[5] += f; h[6] += g; h[7] += h_;
-    
-    for (int i = 0; i < 8; i++) {
-        output[i*4+0] = (h[i] >> 24) & 0xff;
-        output[i*4+1] = (h[i] >> 16) & 0xff;
-        output[i*4+2] = (h[i] >> 8) & 0xff;
-        output[i*4+3] = h[i] & 0xff;
-    }
-}
-
-// Compute RIPEMD160 of SHA256 output (hash160)
-void hash160(__global uchar* output, __global const uchar* input, uint input_len) {
+// Compute hash160 - all private memory
+void hash160_compute(uchar* input, uint input_len, uchar* output) {
     // First compute SHA256
     uchar sha256_hash[32];
-    sha256_single(sha256_hash, input, input_len);
-    
+    sha256_compute(input, input_len, sha256_hash);
+
     // Then compute RIPEMD160
     uint h[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
-    
+
     uchar block[64];
     for (int i = 0; i < 64; i++) {
         block[i] = (i < input_len) ? sha256_hash[i] : 0;
     }
     block[input_len] = 0x80;
-    
+
     uint bit_len = input_len * 8;
     block[56] = (bit_len >> 0) & 0xff;
     block[57] = (bit_len >> 8) & 0xff;
     block[58] = (bit_len >> 16) & 0xff;
     block[59] = (bit_len >> 24) & 0xff;
-    
+
     uint w[16];
     for (int i = 0; i < 16; i++) {
         w[i] = (block[i*4+0] << 24) | (block[i*4+1] << 16) | (block[i*4+2] << 8) | (block[i*4+3]);
     }
-    
-    ripemd160_compress(h, w);
-    
+
+    ripemd160_compress_local(h, w);
+
     for (int i = 0; i < 5; i++) {
         output[i*4+0] = (h[i] >> 0) & 0xff;
         output[i*4+1] = (h[i] >> 8) & 0xff;
@@ -219,53 +211,89 @@ void hash160(__global uchar* output, __global const uchar* input, uint input_len
     }
 }
 
-// Base58 encode (for P2PKH addresses)
-int base58_encode(__global const uchar* hash20, uchar version, __global char* output) {
-    // Convert hash160 to big-endian array
-    ulong value = 0;
+// Base58 encode - all private memory, returns length
+int base58_encode_local(uchar* hash20, uchar version, char* output) {
+    // Convert hash160 to big-endian array (use uint64 for the value)
+    // Note: 20 bytes = 160 bits, won't fit in uint64. Use array approach.
+    uchar be_hash[20];
     for (int i = 0; i < 20; i++) {
-        value = (value << 8) + hash20[i];
+        be_hash[i] = hash20[19 - i];  // Reverse to big-endian
     }
-    
-    // Add version byte
-    ulong full_value = (version << 160) | value;
-    
-    // Count leading zeros in hash
+
+    // Count leading zeros in original hash (little-endian input)
     int leading_zeros = 0;
     for (int i = 0; i < 20; i++) {
         if (hash20[i] == 0) leading_zeros++;
         else break;
     }
-    
-    // Encode to base58
+
+    // Convert to base58 using repeated division
     char temp[35] = {0};
     int pos = 34;
-    
-    while (full_value > 0 && pos >= 0) {
-        ulong div = full_value / 58;
-        int rem = full_value % 58;
-        temp[pos--] = BASE58_CHARS[rem];
-        full_value = div;
+
+    // Use big-endian representation for division
+    int num_bytes = 21;  // version byte + 20 byte hash
+    uchar value[21];
+    value[0] = version;
+    for (int i = 0; i < 20; i++) {
+        value[i + 1] = be_hash[i];
     }
-    
+
+    // Division algorithm
+    int result_len = 0;
+    while (num_bytes > 1 || (num_bytes == 1 && value[0] > 0)) {
+        ulong remainder = 0;
+        int new_len = 0;
+        uchar new_value[21] = {0};
+
+        for (int i = 0; i < num_bytes; i++) {
+            ulong cur = remainder * 256 + value[i];
+            if (cur < 58) {
+                remainder = cur;
+            } else {
+                new_value[new_len++] = (uchar)(cur / 58);
+                remainder = cur % 58;
+            }
+        }
+
+        if (num_bytes > 0 && new_len == 0 && value[0] >= 58) {
+            new_value[0] = value[0] / 58;
+            remainder = value[0] % 58;
+            new_len = 1;
+        }
+
+        temp[pos--] = BASE58_CHARS[(uchar)remainder];
+        result_len++;
+
+        num_bytes = new_len;
+        for (int i = 0; i < num_bytes; i++) {
+            value[i] = new_value[i];
+        }
+    }
+
+    if (pos == 34) {
+        // Value was zero
+        temp[pos--] = BASE58_CHARS[0];
+        result_len++;
+    }
+
     // Fill leading zeros
-    int out_len = 34 - pos;
+    int out_idx = 0;
     for (int i = 0; i < leading_zeros + 1; i++) {
-        output[i] = BASE58_CHARS[0];
+        output[out_idx++] = BASE58_CHARS[0];
     }
-    
-    // Copy rest of string
-    int j = leading_zeros + 1;
+
+    // Copy rest in reverse order
     for (int i = pos + 1; i < 35; i++) {
-        output[j++] = temp[i];
+        output[out_idx++] = temp[i];
     }
-    output[j] = '\0';
-    
-    return j;
+    output[out_idx] = '\0';
+
+    return out_idx;
 }
 
-// Simple string comparison for prefix matching
-bool starts_with(__global char* str, __global char* prefix, int prefix_len) {
+// Simple string comparison for prefix matching (private memory)
+bool starts_with_local(char* str, __global char* prefix, int prefix_len) {
     for (int i = 0; i < prefix_len; i++) {
         if (str[i] != prefix[i]) return false;
     }
@@ -287,13 +315,13 @@ __kernel void generate_and_check(
     unsigned int max_addresses
 ) {
     int gid = get_global_id(0);
-    
+
     if (gid >= batch_size)
         return;
-    
+
     // Generate private key
     unsigned int state = seed + gid;
-    
+
     // Generate 8 unsigned integers (256 bits) for private key
     unsigned int key_words[8];
     for (int i = 0; i < 8; i++) {
@@ -301,31 +329,31 @@ __kernel void generate_and_check(
         key_words[i] = state;
         output_keys[gid * 8 + i] = state;
     }
-    
+
     // Create public key (simplified - use hash of private key as "public key")
     // In real implementation, this would be proper EC multiplication
     uchar pubkey[33];
     pubkey[0] = 0x02; // Compressed public key prefix
-    
+
     // Use first 32 bytes of key_words as public key x coordinate
     for (int i = 0; i < 32; i++) {
         pubkey[i + 1] = (key_words[i % 4] >> ((i % 4) * 8)) & 0xff;
     }
-    
+
     // Generate P2PKH address (hash160 of public key)
     uchar hash20[20];
-    hash160(hash20, pubkey, 33);
-    
+    hash160_compute(pubkey, 33, hash20);
+
     // Base58 encode to get address
     char address[35];
-    base58_encode(hash20, 0x00, address); // 0x00 for mainnet P2PKH
-    
+    base58_encode_local(hash20, 0x00, address); // 0x00 for mainnet P2PKH
+
     // Check prefix match if prefix provided
     bool prefix_match = false;
     if (prefix_len > 0) {
-        prefix_match = starts_with(address, prefix, prefix_len);
+        prefix_match = starts_with_local(address, prefix, prefix_len);
     }
-    
+
     // Check bloom filter if provided (might be a funded address)
     bool might_be_funded = false;
     if (bloom_filter != NULL && filter_size > 0) {
@@ -334,7 +362,7 @@ __kernel void generate_and_check(
                                    hash20[6] | (hash20[7] << 8) | (hash20[8] << 16));
         might_be_funded = bloom_might_contain(bloom_filter, filter_size, addr_hash);
     }
-    
+
     // If might be funded or prefix match, we need to check more carefully
     if (might_be_funded || prefix_match) {
         // Write to results buffer
@@ -362,13 +390,13 @@ __kernel void generate_private_keys(
     unsigned int batch_size
 ) {
     int gid = get_global_id(0);
-    
+
     if (gid >= batch_size)
         return;
-    
+
     // Simple but effective pseudo-random number generator
     unsigned int state = seed + gid;
-    
+
     // Generate 8 unsigned integers (256 bits) for private key
     for (int i = 0; i < 8; i++) {
         // Linear congruential generator
