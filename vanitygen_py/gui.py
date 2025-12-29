@@ -88,6 +88,7 @@ class GeneratorThread(QThread):
                 batch_size=self.batch_size,
                 power_percent=self.gpu_power_percent,
                 device_selector=self.gpu_device_selector,
+                cpu_cores=self.cpu_cores,
             )
         else:
             self.generator = CPUGenerator(

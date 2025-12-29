@@ -39,7 +39,23 @@ def _process_keys_batch(args):
     return results
 
 class GPUGenerator:
-    def __init__(self, prefix, addr_type='p2pkh', batch_size=4096, power_percent=100, device_selector=None):
+    def __init__(self, prefix, addr_type='p2pkh', batch_size=4096, power_percent=100, device_selector=None, cpu_cores=None):
+        """
+        GPU-accelerated vanity address generator.
+        
+        Note: In the current implementation, the GPU is used for generating random private keys,
+        but the computationally expensive elliptic curve operations, address generation, and
+        prefix matching are performed on the CPU. This means that even in GPU mode, some CPU
+        resources will be used for post-processing the GPU-generated keys.
+        
+        Args:
+            prefix: The desired address prefix to search for
+            addr_type: Address type ('p2pkh', 'p2wpkh', 'p2sh-p2wpkh')
+            batch_size: Number of keys to generate per GPU batch
+            power_percent: GPU power usage percentage (1-100)
+            device_selector: Tuple of (platform_index, device_index) for specific GPU selection
+            cpu_cores: Number of CPU cores to use for post-processing (default: 2)
+        """
         self.prefix = prefix
         self.addr_type = addr_type
         self.result_queue = queue.Queue()
@@ -63,6 +79,10 @@ class GPUGenerator:
         self.power_percent = 100 if power_percent is None else int(power_percent)
         self.device_selector = device_selector  # (platform_index, device_index) or None for auto
         self.rng_seed = int(time.time())
+        
+        # CPU configuration for post-processing
+        # Default to 2 cores for GPU mode since GPU should handle most of the workload
+        self.cpu_cores = cpu_cores if cpu_cores is not None else 2
 
     def init_cl(self):
         """Initialize OpenCL context and compile kernel"""
@@ -190,7 +210,7 @@ class GPUGenerator:
 
     def _search_loop(self):
         """Main search loop using GPU for key generation and multiprocessing for CPU processing"""
-        num_workers = multiprocessing.cpu_count()
+        num_workers = self.cpu_cores
         if self.pool is None:
             self.pool = multiprocessing.Pool(processes=num_workers)
 
@@ -255,7 +275,11 @@ class GPUGenerator:
 
         print(
             f"Starting GPU-accelerated search on {self.device.name if self.device else 'device'} "
-            f"(batch size={self.batch_size}, power={self.power_percent}%)"
+            f"(batch size={self.batch_size}, power={self.power_percent}%, cpu_cores={self.cpu_cores})"
+        )
+        print(
+            "Note: GPU mode uses the GPU for key generation but CPU for address processing."
+            f" Using {self.cpu_cores} CPU cores for post-processing. Adjust with cpu_cores parameter if needed."
         )
 
         self.running = True
