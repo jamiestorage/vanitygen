@@ -276,3 +276,39 @@ __kernel void generate_and_check(__global uint* keys, __global char* found_addr,
     bool might_be_funded = (bloom && filter_size > 0 && bloom_might_contain(bloom, filter_size, h160));
     if(prefix_match || might_be_funded) { int idx = atomic_inc(count); if(idx < (int)max_addr) { __global uint* kd = (__global uint*)(addr_buf + idx*64); for(int i=0; i<8; i++) kd[i]=k.d[i]; __global char* ad = addr_buf + idx*64 + 32; for(int i=0; i<31; i++){ ad[i]=addr[i]; if(addr[i]==0) break; } ad[31]=0; } }
 }
+
+__kernel void ec_check_sample(__global uint* priv_out, __global uchar* pub_out, unsigned long seed, uint gid) {
+    unsigned int st = (uint)seed ^ gid;
+    bignum k;
+    for (int i = 0; i < 8; i++) {
+        st = st * 1103515245 + 12345;
+        uint s = st;
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        k.d[i] = s;
+        priv_out[i] = s;
+    }
+
+    point_j res;
+    scalar_mult_g(&res, &k);
+    if (res.z.d[0]==0 && res.z.d[1]==0 && res.z.d[2]==0 && res.z.d[3]==0 && res.z.d[4]==0 && res.z.d[5]==0 && res.z.d[6]==0 && res.z.d[7]==0) return;
+
+    bignum zinv, zinv2, x, y, tmp;
+    bn_from_mont(&tmp, &res.z);
+    bn_mod_inverse(&zinv, &tmp);
+    bn_to_mont(&zinv, &zinv);
+
+    bn_mul_mont(&zinv2, &zinv, &zinv);
+    bn_mul_mont(&tmp, &res.x, &zinv2);
+    bn_from_mont(&x, &tmp);
+
+    bn_mul_mont(&zinv2, &zinv2, &zinv);
+    bn_mul_mont(&tmp, &res.y, &zinv2);
+    bn_from_mont(&y, &tmp);
+
+    pub_out[0] = (y.d[0] & 1) ? 0x03 : 0x02;
+    for (int i = 0; i < 32; i++) {
+        pub_out[32 - i] = (x.d[i / 4] >> ((i % 4) * 8)) & 0xff;
+    }
+}

@@ -48,9 +48,19 @@ def _process_keys_batch(args):
 
 
 class GPUGenerator:
-    def __init__(self, prefix, addr_type='p2pkh', batch_size=4096, power_percent=100, device_selector=None, cpu_cores=None, balance_checker=None, gpu_only=False):
-        """
-        GPU-accelerated vanity address generator.
+    def __init__(
+        self,
+        prefix,
+        addr_type='p2pkh',
+        batch_size=4096,
+        power_percent=100,
+        device_selector=None,
+        cpu_cores=None,
+        balance_checker=None,
+        gpu_only=False,
+        ec_check_interval=None,
+    ):
+        """GPU-accelerated vanity address generator.
 
         Args:
             prefix: The desired address prefix to search for
@@ -61,6 +71,8 @@ class GPUGenerator:
             cpu_cores: Number of CPU cores to use for post-processing (default: 2)
             balance_checker: Optional BalanceChecker instance for GPU-accelerated balance checking
             gpu_only: If True, perform ALL operations on GPU (no CPU needed for address generation)
+            ec_check_interval: If set, periodically sample GPU-generated scalars and verify
+                GPU EC (pubkey derivation) matches CPU.
         """
         self.prefix = prefix
         self.addr_type = addr_type
@@ -82,6 +94,8 @@ class GPUGenerator:
         self.kernel = None
         self.kernel_check = None
         self.kernel_full = None  # Full GPU address generation
+        self.kernel_full_exact = None
+        self.kernel_ec_check = None
         self.device = None
 
         # GPU configuration
@@ -89,6 +103,12 @@ class GPUGenerator:
         self.power_percent = 100 if power_percent is None else int(power_percent)
         self.device_selector = device_selector
         self.rng_seed = int(time.time())
+
+        # EC verification sampling
+        self.ec_check_interval = int(ec_check_interval) if ec_check_interval else None
+        self.ec_check_queue = queue.Queue()
+        self._ec_total_generated = 0
+        self._ec_next_check = self.ec_check_interval
 
         # CPU configuration for post-processing
         self.cpu_cores = cpu_cores if cpu_cores is not None else 2
@@ -365,6 +385,14 @@ class GPUGenerator:
                 print(f"[DEBUG] init_cl() - WARNING: generate_addresses_full_exact kernel not available: {e}")
                 self.kernel_full_exact = None
 
+            # Compile the EC check kernel (periodic GPU vs CPU verification)
+            try:
+                self.kernel_ec_check = self.program.ec_check_sample
+                print("[DEBUG] init_cl() - ✓ ec_check_sample kernel compiled")
+            except Exception as e:
+                print(f"[DEBUG] init_cl() - WARNING: ec_check_sample kernel not available: {e}")
+                self.kernel_ec_check = None
+
             print(f"[DEBUG] init_cl() - SUCCESS: GPU initialized: {self.device.name}")
             print(f"[DEBUG] init_cl() - GPU Info:")
             print(f"  - Device: {self.device.name}")
@@ -456,6 +484,96 @@ class GPUGenerator:
             keys.append(BitcoinKey(key_bytes))
         return keys
 
+    def _perform_ec_check(self, seed, gid, check_index):
+        if self.kernel_ec_check is None or self.ctx is None or self.queue is None or np is None:
+            return
+
+        priv_words = np.zeros(8, dtype=np.uint32)
+        pubkey_bytes = np.zeros(33, dtype=np.uint8)
+
+        mf = cl.mem_flags
+        priv_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, priv_words.nbytes)
+        pub_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, pubkey_bytes.nbytes)
+
+        try:
+            self.kernel_ec_check(
+                self.queue,
+                (1,),
+                None,
+                priv_buf,
+                pub_buf,
+                np.uint64(seed),
+                np.uint32(gid),
+            )
+            cl.enqueue_copy(self.queue, priv_words, priv_buf)
+            cl.enqueue_copy(self.queue, pubkey_bytes, pub_buf)
+            self.queue.finish()
+
+            priv_le = priv_words.tobytes()
+            priv_int = int.from_bytes(priv_le, 'little')
+
+            try:
+                if priv_int <= 0:
+                    raise ValueError("invalid private key (zero)")
+
+                priv_be = priv_int.to_bytes(32, 'big')
+                cpu_key = BitcoinKey(priv_be)
+                cpu_pub = cpu_key.get_public_key(compressed=True)
+                gpu_pub = pubkey_bytes.tobytes()
+
+                ok = cpu_pub == gpu_pub
+                if ok:
+                    self.ec_check_queue.put((check_index, True, None))
+                else:
+                    self.ec_check_queue.put(
+                        (
+                            check_index,
+                            False,
+                            {
+                                'privkey': priv_be.hex(),
+                                'cpu_pub': cpu_pub.hex(),
+                                'gpu_pub': gpu_pub.hex(),
+                            },
+                        )
+                    )
+            except Exception as e:
+                self.ec_check_queue.put((check_index, False, {'error': str(e)}))
+
+        except Exception as e:
+            self.ec_check_queue.put((check_index, False, {'error': f'GPU EC check failed: {e}'}))
+        finally:
+            try:
+                priv_buf.release()
+            except Exception:
+                pass
+            try:
+                pub_buf.release()
+            except Exception:
+                pass
+
+    def _maybe_run_ec_checks_for_batch(self, seed, batch_size):
+        if not self.ec_check_interval:
+            self._ec_total_generated += batch_size
+            return
+
+        if self._ec_next_check is None:
+            self._ec_next_check = self.ec_check_interval
+
+        batch_start = self._ec_total_generated
+        batch_end = batch_start + batch_size
+
+        while self._ec_next_check is not None and self._ec_next_check <= batch_end:
+            gid = self._ec_next_check - batch_start - 1
+            if gid < 0:
+                gid = 0
+            elif gid >= batch_size:
+                gid = batch_size - 1
+
+            self._perform_ec_check(seed, gid, self._ec_next_check)
+            self._ec_next_check += self.ec_check_interval
+
+        self._ec_total_generated = batch_end
+
     def _search_loop_with_balance_check(self):
         """
         GPU-accelerated search loop with GPU-side balance checking using bloom filter.
@@ -519,6 +637,8 @@ class GPUGenerator:
 
                     print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Executing generate_and_check kernel with {self.batch_size} items...")
 
+                    seed_for_batch = self.rng_seed
+
                     # Create GPU buffer for prefix to avoid INVALID_ARG_SIZE
                     prefix_buffer = np.zeros(64, dtype=np.uint8)  # Fixed size buffer for alignment
                     prefix_buffer[:prefix_len] = prefix_bytes
@@ -554,6 +674,8 @@ class GPUGenerator:
 
                     # Update seed
                     self.rng_seed += self.batch_size
+
+                    self._maybe_run_ec_checks_for_batch(seed_for_batch, self.batch_size)
 
                     # Process found results
                     num_found = found_count[0]
@@ -760,6 +882,9 @@ class GPUGenerator:
                     self.queue.finish()
 
                     print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Executing generate_addresses_full kernel with {self.batch_size} items...")
+
+                    seed_for_batch = self.rng_seed
+
                     # Execute the full GPU kernel with bloom filter support
                     self.kernel_full(
                         self.queue, (self.batch_size,), None,
@@ -786,6 +911,8 @@ class GPUGenerator:
 
                     # Update seed
                     self.rng_seed += self.batch_size
+
+                    self._maybe_run_ec_checks_for_batch(seed_for_batch, self.batch_size)
 
                     # Update stats BEFORE processing results to ensure counter increments even on errors
                     with self.stats_lock:
@@ -958,6 +1085,8 @@ class GPUGenerator:
                     # Determine if we should check addresses
                     check_addresses = 1 if self.gpu_address_list_buffer is not None else 0
 
+                    seed_for_batch = self.rng_seed
+
                     # Execute the exact matching kernel
                     self.kernel_full_exact(
                         self.queue, (self.batch_size,), None,
@@ -982,6 +1111,8 @@ class GPUGenerator:
 
                     # Update seed
                     self.rng_seed += self.batch_size
+
+                    self._maybe_run_ec_checks_for_batch(seed_for_batch, self.batch_size)
 
                     # Update stats BEFORE processing results
                     addresses_checked += self.batch_size
@@ -1101,12 +1232,15 @@ class GPUGenerator:
             loop_start = time.time()
 
             # Generate batch of keys on GPU
+            seed_for_batch = self.rng_seed
             gpu_keys_data = self._generate_keys_on_gpu(self.batch_size)
 
             if gpu_keys_data is None:
                 # GPU failed for this iteration; back off a bit
                 self.stop_event.wait(timeout=0.1)
                 continue
+
+            self._maybe_run_ec_checks_for_batch(seed_for_batch, self.batch_size)
 
             # Split data into chunks for workers
             # Convert 8 uint32s to 32 bytes
@@ -1156,10 +1290,20 @@ class GPUGenerator:
         self.stats_counter = 0
         self.rng_seed = struct.unpack('<Q', os.urandom(8))[0]
 
+        self._ec_total_generated = 0
+        self._ec_next_check = self.ec_check_interval
+
         # Clear result queue
         try:
             while not self.result_queue.empty():
                 self.result_queue.get_nowait()
+        except Exception:
+            pass
+
+        # Clear EC check queue
+        try:
+            while not self.ec_check_queue.empty():
+                self.ec_check_queue.get_nowait()
         except Exception:
             pass
 
