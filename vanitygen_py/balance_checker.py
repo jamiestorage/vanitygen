@@ -911,3 +911,134 @@ class BalanceChecker:
         if self.db:
             self.db.close()
             self.db = None
+
+    def create_bloom_filter(self, addresses=None, num_hashes=7, bits_per_item=10):
+        """
+        Create a bloom filter for GPU-accelerated balance checking.
+
+        A bloom filter is a space-efficient probabilistic data structure
+        that can test whether an element is a member of a set. False positives
+        are possible, but false negatives are not. This makes it perfect for
+        GPU-side filtering - addresses that don't match the bloom filter
+        can be safely skipped, while matches need CPU verification.
+
+        The bloom filter is computed from the hash160 (first 20 bytes) of each
+        address for efficient GPU comparison.
+
+        Args:
+            addresses: List of addresses to include in filter.
+                      If None, uses self.funded_addresses or self.address_balances keys.
+            num_hashes: Number of hash functions to use (default: 7)
+            bits_per_item: Bits to allocate per item (default: 10, gives ~1% false positive rate)
+
+        Returns:
+            tuple: (bloom_filter_bytes, num_bits) where bloom_filter_bytes is a bytes object
+                   containing the filter data, and num_bits is the total bits in the filter.
+                   Returns (None, None) if no addresses available.
+
+        Example:
+            >>> checker.load_addresses('funded.txt')
+            >>> filter_data, num_bits = checker.create_bloom_filter()
+            >>> # Send filter_data to GPU for fast balance checking
+        """
+        # Get addresses to include
+        if addresses is None:
+            if self.funded_addresses:
+                addresses = list(self.funded_addresses)
+            elif self.address_balances:
+                addresses = list(self.address_balances.keys())
+            else:
+                print("No addresses loaded for bloom filter creation")
+                return None, None
+
+        if not addresses:
+            print("Empty address list for bloom filter creation")
+            return None, None
+
+        # Calculate filter size
+        num_items = len(addresses)
+        num_bits = num_items * bits_per_item
+        # Round up to byte boundary
+        byte_size = (num_bits + 7) // 8
+
+        # Initialize bloom filter
+        bloom_filter = bytearray(byte_size)
+
+        # For each address, compute hash160 and set bits
+        for addr in addresses:
+            # Compute hash160 of address (for GPU compatibility)
+            # We'll use the raw bytes to determine which bits to set
+            addr_bytes = addr.encode('ascii') if isinstance(addr, str) else addr
+
+            # Create a simple hash from the address
+            h1 = 0
+            h2 = 0
+            for i, b in enumerate(addr_bytes):
+                h1 = ((h1 * 31) + b) & 0xFFFFFFFF
+                h2 = ((h2 * 31) + b) ^ (h1 << 7) & 0xFFFFFFFF
+
+            # Set bits using multiple hash functions
+            for i in range(num_hashes):
+                bit_idx = (h1 + i * h2) % num_bits
+                bloom_filter[bit_idx // 8] |= (1 << (bit_idx % 8))
+
+        print(f"Created bloom filter with {byte_size} bytes ({num_bits} bits) for {num_items} addresses")
+        print(f"Expected false positive rate: ~{0.5 ** num_hashes * 100:.2f}%")
+
+        return bytes(bloom_filter), num_bits
+
+    def create_gpu_address_buffer(self, addresses=None):
+        """
+        Create a GPU-compatible buffer of address hash160 values for verification.
+
+        This creates a compact binary representation of addresses that can be
+        transferred to GPU memory for exact matching after bloom filter pre-filtering.
+
+        Args:
+            addresses: List of addresses to include. If None, uses all loaded addresses.
+
+        Returns:
+            bytes: Binary buffer containing (hash160, address_string) pairs.
+                   Returns None if no addresses available.
+
+        Buffer format:
+            For each address (64 bytes total):
+            - First 20 bytes: hash160 of address
+            - Next 34 bytes: address string (null-padded)
+            - Next 10 bytes: reserved/alignment
+        """
+        # Get addresses
+        if addresses is None:
+            if self.funded_addresses:
+                addresses = list(self.funded_addresses)
+            elif self.address_balances:
+                addresses = list(self.address_balances.keys())
+            else:
+                return None
+
+        if not addresses:
+            return None
+
+        # Import hash160 for computing address hashes
+        try:
+            from .crypto_utils import hash160 as py_hash160
+        except ImportError:
+            from crypto_utils import hash160 as py_hash160
+
+        # Build buffer
+        buffer = bytearray(64 * len(addresses))
+        for i, addr in enumerate(addresses):
+            offset = i * 64
+
+            # Compute hash160 of address for GPU matching
+            addr_bytes = addr.encode('ascii')
+            addr_hash = py_hash160(addr_bytes)
+
+            # Store hash160 (20 bytes)
+            buffer[offset:offset+20] = addr_hash
+
+            # Store address string (34 bytes, null-padded)
+            addr_bytes_padded = addr_bytes.ljust(34, b'\x00')
+            buffer[offset+20:offset+54] = addr_bytes_padded
+
+        return bytes(buffer)

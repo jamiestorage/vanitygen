@@ -50,7 +50,7 @@ class LoadBitcoinCoreThread(QThread):
 class GeneratorThread(QThread):
     stats_updated = Signal(int, float)
     address_found = Signal(str, str, str, float, bool)
-    
+
     def __init__(
         self,
         prefix,
@@ -63,6 +63,7 @@ class GeneratorThread(QThread):
         cpu_cores=None,
         gpu_power_percent=100,
         gpu_device_selector=None,
+        gpu_only=False,
     ):
         super().__init__()
         self.prefix = prefix
@@ -76,6 +77,7 @@ class GeneratorThread(QThread):
         self.cpu_cores = cpu_cores
         self.gpu_power_percent = gpu_power_percent
         self.gpu_device_selector = gpu_device_selector
+        self.gpu_only = gpu_only
 
         self.generator = None
         self.running = True
@@ -89,6 +91,8 @@ class GeneratorThread(QThread):
                 power_percent=self.gpu_power_percent,
                 device_selector=self.gpu_device_selector,
                 cpu_cores=self.cpu_cores,
+                balance_checker=self.balance_checker,
+                gpu_only=self.gpu_only,
             )
         else:
             self.generator = CPUGenerator(
@@ -232,7 +236,12 @@ class VanityGenGUI(QMainWindow):
         self.gpu_device_combo = QComboBox()
         device_layout.addWidget(self.gpu_device_combo)
         gpu_settings_layout.addLayout(device_layout)
-        
+
+        # GPU Only mode checkbox
+        self.gpu_only_check = QCheckBox("GPU Only Mode (ALL operations on GPU)")
+        self.gpu_only_check.setToolTip("When enabled, ALL operations (key generation, address generation, matching) happen on GPU.\nThis eliminates CPU load entirely but may be slightly slower than GPU+CPU combined.")
+        gpu_settings_layout.addWidget(self.gpu_only_check)
+
         self.gpu_settings_widget.setLayout(gpu_settings_layout)
         self.gpu_settings_widget.setVisible(False)  # Hidden by default
         settings_layout.addWidget(self.gpu_settings_widget)
@@ -286,10 +295,25 @@ class VanityGenGUI(QMainWindow):
         
         self.balance_status_label = QLabel("Balance checking not active")
         settings_layout.addWidget(self.balance_status_label)
-        
+
+        # Control buttons layout
+        control_layout = QHBoxLayout()
+
         self.start_btn = QPushButton("Start Generation")
         self.start_btn.clicked.connect(self.toggle_generation)
-        settings_layout.addWidget(self.start_btn)
+        control_layout.addWidget(self.start_btn)
+
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.clicked.connect(self.pause_generation)
+        self.pause_btn.setEnabled(False)
+        control_layout.addWidget(self.pause_btn)
+
+        self.resume_btn = QPushButton("Resume")
+        self.resume_btn.clicked.connect(self.resume_generation)
+        self.resume_btn.setEnabled(False)
+        control_layout.addWidget(self.resume_btn)
+
+        settings_layout.addLayout(control_layout)
         
         settings_tab.setLayout(settings_layout)
         tabs.addTab(settings_tab, "Settings")
@@ -554,16 +578,21 @@ Whoever has this key controls these funds.<br><br>
         gpu_power_percent = 100
         gpu_device_selector = None
         batch_size = 4096
+        gpu_only = False
 
         if mode == 'gpu':
             batch_size = int(self.batch_size_combo.currentText())
             gpu_power_percent = int(self.gpu_power_slider.value())
+            gpu_only = self.gpu_only_check.isChecked()
             if self.gpu_device_options and self.gpu_device_combo.currentIndex() < len(self.gpu_device_options):
                 gpu_device_selector = self.gpu_device_options[self.gpu_device_combo.currentIndex()]
 
+            mode_str = "GPU Only" if gpu_only else "GPU"
             self.log_output.append(
-                f"Using GPU: batch size={batch_size}, power={gpu_power_percent}%, device={self.gpu_device_combo.currentText()}"
+                f"Using {mode_str}: batch size={batch_size}, power={gpu_power_percent}%, device={self.gpu_device_combo.currentText()}"
             )
+            if gpu_only:
+                self.log_output.append("WARNING: GPU Only mode performs ALL operations on GPU (no CPU address generation)")
         else:
             cpu_cores = int(self.cpu_cores_spin.value())
             self.log_output.append(f"Using CPU cores: {cpu_cores}")
@@ -579,6 +608,7 @@ Whoever has this key controls these funds.<br><br>
             cpu_cores=cpu_cores,
             gpu_power_percent=gpu_power_percent,
             gpu_device_selector=gpu_device_selector,
+            gpu_only=gpu_only,
         )
         self.gen_thread.stats_updated.connect(self.update_stats)
         self.gen_thread.address_found.connect(self.on_address_found)
@@ -586,7 +616,9 @@ Whoever has this key controls these funds.<br><br>
         
         self.gen_thread.start()
         self.start_btn.setText("Stop Generation")
-        
+        self.pause_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+
         if self.search_all_types_check.isChecked():
             self.log_output.append("Started searching for ALL Bitcoin address types...")
         else:
@@ -596,6 +628,50 @@ Whoever has this key controls these funds.<br><br>
         if self.gen_thread:
             self.gen_thread.stop()
             self.start_btn.setText("Start Generation")
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(False)
+
+    def pause_generation(self):
+        """Pause the current generation"""
+        if self.gen_thread and self.gen_thread.isRunning():
+            self.gen_thread.generator.pause()
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(True)
+            self.log_output.append("Generation paused")
+            self.update_status_labels()
+
+    def resume_generation(self):
+        """Resume the current generation"""
+        if self.gen_thread and self.gen_thread.isRunning():
+            self.gen_thread.generator.resume()
+            self.pause_btn.setEnabled(True)
+            self.resume_btn.setEnabled(False)
+            self.log_output.append("Generation resumed")
+            self.update_status_labels()
+
+    def update_status_labels(self):
+        """Update status labels based on current state"""
+        if not self.gen_thread or not self.gen_thread.isRunning():
+            self.cpu_status_label.setText("Idle")
+            self.cpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+            self.gpu_status_label.setText("Idle")
+            self.gpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+            return
+
+        if self.gen_thread.generator.is_paused():
+            if self.gen_thread.mode == 'cpu':
+                self.cpu_status_label.setText("Paused")
+                self.cpu_status_label.setStyleSheet("color: orange; font-weight: bold;")
+            else:
+                self.gpu_status_label.setText("Paused")
+                self.gpu_status_label.setStyleSheet("color: orange; font-weight: bold;")
+        else:
+            if self.gen_thread.mode == 'cpu':
+                self.cpu_status_label.setText("Active")
+                self.cpu_status_label.setStyleSheet("color: green; font-weight: bold;")
+            else:
+                self.gpu_status_label.setText("Active")
+                self.gpu_status_label.setStyleSheet("color: green; font-weight: bold;")
 
     def update_stats(self, total_keys, speed):
         self.stats_label.setText(f"Keys Searched: {total_keys} | Speed: {speed:.2f} keys/s")
@@ -673,6 +749,14 @@ Whoever has this key controls these funds.<br><br>
 
     def on_gen_finished(self):
         self.start_btn.setText("Start Generation")
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.cpu_activity_bar.setValue(0)
+        self.gpu_activity_bar.setValue(0)
+        self.cpu_status_label.setText("Idle")
+        self.cpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
+        self.gpu_status_label.setText("Idle")
+        self.gpu_status_label.setStyleSheet("color: gray; font-weight: bold;")
         self.log_output.append("Generation stopped.")
 
 def main():
