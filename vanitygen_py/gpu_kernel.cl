@@ -75,9 +75,17 @@ uint bloom_hash(uint3 data, uint seed, uint m) {
 
 // Check if address matches bloom filter (might be a match)
 bool bloom_might_contain(__global uchar* bloom_filter, uint filter_size, uint3 addr_hash) {
+    uint filter_bits = filter_size * 8;
+    
     for (uint i = 0; i < BLOOM_HASH_COUNT; i++) {
-        uint bit_idx = bloom_hash(addr_hash, i, filter_size * 8);
-        if (!bloom_filter[bit_idx / 8]) return false;
+        uint bit_idx = bloom_hash(addr_hash, i, filter_bits);
+        uint byte_idx = bit_idx / 8;
+        uint bit_offset = bit_idx % 8;
+        
+        // Check the specific bit, not the whole byte
+        if (!(bloom_filter[byte_idx] & (1 << bit_offset))) {
+            return false;
+        }
     }
     return true;
 }
@@ -496,6 +504,156 @@ __kernel void generate_addresses_full(
 
             // Store bloom filter match flag (offset 96)
             dest[96] = might_be_funded ? 1 : 0;
+        }
+    }
+}
+
+// Binary search for hash160 in sorted array
+// Returns: 1 if found, 0 if not found
+int binary_search_hash160(__global uchar* sorted_array, uint num_addresses, uchar* target_hash160) {
+    int left = 0;
+    int right = (int)num_addresses - 1;
+    
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        __global uchar* mid_hash = sorted_array + mid * 20;
+        
+        // Compare the 20-byte hash160 values
+        int cmp = 0;
+        for (int i = 0; i < 20; i++) {
+            if (target_hash160[i] < mid_hash[i]) {
+                cmp = -1;
+                break;
+            } else if (target_hash160[i] > mid_hash[i]) {
+                cmp = 1;
+                break;
+            }
+        }
+        
+        if (cmp == 0) {
+            return 1;  // Found
+        } else if (cmp < 0) {
+            right = mid - 1;
+        } else {
+            left = mid + 1;
+        }
+    }
+    
+    return 0;  // Not found
+}
+
+// Check if address hash160 is in GPU-resident address list
+// This kernel performs exact address matching with NO false positives
+__kernel void check_address_in_gpu_list(
+    __global uchar* hash160_list,      // Sorted array of hash160 values (20 bytes each)
+    unsigned int num_addresses,        // Number of addresses in the list
+    __global uchar* test_hash160,      // Hash160 values to test (20 bytes each)
+    __global int* match_results,       // Output: 1 if match, 0 if no match
+    unsigned int num_tests             // Number of hash160 values to test
+) {
+    int gid = get_global_id(0);
+    
+    if (gid >= num_tests)
+        return;
+    
+    // Get the hash160 to test
+    uchar target_hash160[20];
+    for (int i = 0; i < 20; i++) {
+        target_hash160[i] = test_hash160[gid * 20 + i];
+    }
+    
+    // Binary search in sorted array
+    int found = binary_search_hash160(hash160_list, num_addresses, target_hash160);
+    match_results[gid] = found;
+}
+
+// Full GPU address generation with exact address list checking (NO bloom filter)
+// This kernel generates private keys, computes hash160, base58 encodes,
+// checks for prefix matches, and checks against exact GPU-resident address list
+__kernel void generate_addresses_full_exact(
+    __global uchar* found_addresses,     // Output: [key_bytes (32)][address_str (64)]
+    __global int* found_count,
+    unsigned long seed,
+    unsigned int batch_size,
+    __global char* prefix,
+    int prefix_len,
+    unsigned int max_addresses,
+    __global uchar* address_list,        // Sorted array of hash160 values
+    unsigned int address_list_count,     // Number of addresses in list
+    unsigned int check_addresses         // Whether to check address list (1=yes, 0=no)
+) {
+    int gid = get_global_id(0);
+    
+    if (gid >= batch_size)
+        return;
+    
+    // Generate private key using LCG
+    unsigned int state = seed + gid;
+    unsigned int key_words[8];
+    for (int i = 0; i < 8; i++) {
+        state = state * 1103515245 + 12345;
+        key_words[i] = state;
+    }
+    
+    // Create simplified public key from private key
+    uchar pubkey[33];
+    pubkey[0] = 0x02; // Compressed public key prefix
+    for (int i = 0; i < 32; i++) {
+        pubkey[i + 1] = (key_words[i % 4] >> ((i % 4) * 8)) & 0xff;
+    }
+    
+    // Compute hash160 (SHA256 + RIPEMD160)
+    uchar hash20[20];
+    hash160_compute(pubkey, 33, hash20);
+    
+    // Base58 encode to get P2PKH address
+    char address[64];
+    base58_encode_local(hash20, 0x00, address);
+    
+    // Check for prefix match
+    bool prefix_match = false;
+    if (prefix_len > 0) {
+        prefix_match = true;
+        for (int i = 0; i < prefix_len; i++) {
+            if (address[i] != prefix[i]) {
+                prefix_match = false;
+                break;
+            }
+        }
+    }
+    
+    // Check exact address list for funded address match (NO false positives)
+    bool is_funded = false;
+    if (check_addresses && address_list != NULL && address_list_count > 0) {
+        is_funded = binary_search_hash160(address_list, address_list_count, hash20);
+    }
+    
+    // Match if: prefix matches OR is in funded address list
+    bool match = prefix_match || is_funded;
+    
+    // If match, write to results
+    if (match) {
+        int idx = atomic_inc(found_count);
+        if (idx < (int)max_addresses) {
+            __global uchar* dest = found_addresses + idx * 128;
+            
+            // Store 32-byte key
+            for (int i = 0; i < 8; i++) {
+                dest[i*4 + 0] = (key_words[i] >> 0) & 0xff;
+                dest[i*4 + 1] = (key_words[i] >> 8) & 0xff;
+                dest[i*4 + 2] = (key_words[i] >> 16) & 0xff;
+                dest[i*4 + 3] = (key_words[i] >> 24) & 0xff;
+            }
+            
+            // Store null-terminated address string (offset 32)
+            __global char* addr_dest = (__global char*)(dest + 32);
+            for (int i = 0; i < 64; i++) {
+                addr_dest[i] = address[i];
+                if (address[i] == '\0') break;
+            }
+            
+            // Store funded flag (offset 96) - 1 if in address list, 0 otherwise
+            dest[96] = is_funded ? 1 : 0;
         }
     }
 }

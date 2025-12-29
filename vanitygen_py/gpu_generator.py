@@ -98,6 +98,11 @@ class GPUGenerator:
 
         # GPU-only mode: do everything on GPU
         self.gpu_only = gpu_only
+        
+        # GPU address list (for direct GPU memory loading, no bloom filter)
+        self.gpu_address_list = None
+        self.gpu_address_list_count = 0
+        self.gpu_address_list_buffer = None
 
     def set_balance_checker(self, balance_checker):
         """
@@ -156,6 +161,63 @@ class GPUGenerator:
             print(f"Failed to setup GPU balance checking: {e}")
             import traceback
             traceback.print_exc()
+
+    def _setup_gpu_address_list(self):
+        """
+        Set up GPU address list for direct GPU memory loading.
+        
+        This method transfers the entire address list to GPU memory for exact matching
+        without bloom filter false positives. Addresses are stored as a sorted array
+        of hash160 values for binary search lookups.
+        
+        Returns:
+            bool: True if setup successful, False otherwise
+        """
+        if not self.balance_checker or not self.ctx:
+            return False
+        
+        try:
+            # Create GPU address list (sorted array format)
+            address_list_info = self.balance_checker.create_gpu_address_list(format='sorted_array')
+            if address_list_info is None:
+                print("Failed to create GPU address list")
+                return False
+            
+            # Check GPU memory availability
+            device_mem = self.device.global_mem_size
+            required_mem = address_list_info['size_bytes']
+            
+            print(f"GPU memory available: {device_mem / (1024**3):.2f} GB")
+            print(f"Address list size: {required_mem / (1024**2):.2f} MB ({address_list_info['count']} addresses)")
+            
+            # Ensure we have at least 2x the required memory (for other buffers)
+            if required_mem * 2 > device_mem:
+                print(f"WARNING: Insufficient GPU memory!")
+                print(f"Required: {required_mem * 2 / (1024**2):.2f} MB (including overhead)")
+                print(f"Available: {device_mem / (1024**2):.2f} MB")
+                return False
+            
+            # Allocate GPU buffer for address list
+            mf = cl.mem_flags
+            address_data = np.frombuffer(address_list_info['data'], dtype=np.uint8)
+            self.gpu_address_list_buffer = cl.Buffer(
+                self.ctx, 
+                mf.READ_ONLY | mf.COPY_HOST_PTR,
+                hostbuf=address_data
+            )
+            self.gpu_address_list_count = address_list_info['count']
+            
+            print(f"GPU address list loaded successfully: {self.gpu_address_list_count} addresses")
+            print(f"Memory usage: {required_mem / (1024**2):.2f} MB")
+            print("Using exact matching (NO false positives)")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Failed to setup GPU address list: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def init_cl(self):
         """Initialize OpenCL context and compile kernel"""
@@ -224,6 +286,16 @@ class GPUGenerator:
             except Exception:
                 print("Note: Full GPU kernel not available, will use CPU for address generation")
                 self.kernel_full = None
+            
+            # Compile the exact address matching kernel for GPU-only mode with direct address list
+            try:
+                self.kernel_full_exact = self.program.generate_addresses_full_exact
+                self.kernel_check_address = self.program.check_address_in_gpu_list
+                print("Exact address matching kernel compiled (GPU-only mode with address list)")
+            except Exception as e:
+                print(f"Note: Exact address matching kernel not available: {e}")
+                self.kernel_full_exact = None
+                self.kernel_check_address = None
 
             print(f"GPU initialized: {self.device.name}")
             return True
@@ -453,11 +525,25 @@ class GPUGenerator:
         1. Private key generation on GPU
         2. Address generation (hash160 + base58) on GPU
         3. Prefix matching on GPU
-        4. Balance checking (bloom filter) on GPU
+        4. Balance checking (exact address list OR bloom filter) on GPU
 
         Only matching results are returned to CPU for display.
         Zero CPU usage for address generation - GPU handles everything!
         """
+        # Determine which kernel to use based on available resources
+        use_exact_matching = (
+            self.kernel_full_exact is not None and 
+            self.gpu_address_list_buffer is not None and 
+            self.gpu_address_list_count > 0
+        )
+        
+        if use_exact_matching:
+            # Use exact address matching kernel (NO false positives)
+            print("Using exact address matching kernel (GPU-resident address list)")
+            self._search_loop_gpu_only_exact()
+            return
+        
+        # Fall back to bloom filter or no balance checking
         if self.kernel_full is None:
             print("Full GPU kernel not available, falling back to CPU-assisted mode")
             if self.balance_checker and self.gpu_bloom_filter is not None:
@@ -650,6 +736,189 @@ class GPUGenerator:
                 pass
             self.gpu_prefix_buffer = None
 
+    def _search_loop_gpu_only_exact(self):
+        """
+        GPU-only search loop with EXACT address list matching.
+        
+        This method loads addresses directly into GPU memory and performs
+        exact matching using binary search (NO bloom filter, NO false positives).
+        
+        Features:
+        - All operations on GPU (key gen + address gen + matching)
+        - Exact address matching (no false positives)
+        - Binary search in sorted array (O(log n))
+        - Progress tracking with pause/resume/stop support
+        """
+        # Allocate result buffer (128 bytes per match: 32 key + 64 addr + 32 spare)
+        max_results = 512
+        results_buffer = np.zeros(max_results * 128, dtype=np.uint8)
+        found_count = np.zeros(1, dtype=np.int32)
+        
+        # Prepare prefix for GPU - create fixed-size buffer
+        prefix_bytes = self.prefix.encode('ascii')
+        prefix_len = len(prefix_bytes)
+        # Pad to 64 bytes for alignment
+        prefix_buffer = np.zeros(64, dtype=np.uint8)
+        prefix_buffer[:prefix_len] = np.frombuffer(prefix_bytes, dtype=np.uint8)
+        
+        print(f"Starting GPU-only mode with EXACT address matching (batch size={self.batch_size})")
+        print(f"Address list: {self.gpu_address_list_count} addresses in GPU memory")
+        print("NO false positives - exact binary search matching!")
+        
+        # Allocate GPU buffer for prefix
+        mf = cl.mem_flags
+        gpu_prefix_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=prefix_buffer)
+        
+        # Store prefix buffer for cleanup
+        self.gpu_prefix_buffer_exact = gpu_prefix_buffer
+        
+        # Track statistics
+        matches_found = 0
+        addresses_checked = 0
+        
+        while not self.stop_event.is_set():
+            # Check if paused
+            if self.pause_event.is_set():
+                time.sleep(0.1)
+                continue
+            
+            loop_start = time.time()
+            
+            try:
+                mf = cl.mem_flags
+                
+                # Create output buffer for results
+                results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
+                found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
+                
+                # Reset found count on GPU
+                cl.enqueue_copy(self.queue, found_count_buf, found_count)
+                self.queue.finish()
+                
+                # Determine if we should check addresses
+                check_addresses = 1 if self.gpu_address_list_buffer is not None else 0
+                
+                # Execute the exact matching kernel
+                self.kernel_full_exact(
+                    self.queue, (self.batch_size,), None,
+                    results_buf,                              # found_addresses
+                    found_count_buf,                          # found_count
+                    np.uint64(self.rng_seed),                 # seed
+                    np.uint32(self.batch_size),               # batch_size
+                    gpu_prefix_buffer,                        # prefix
+                    np.int32(prefix_len),                     # prefix_len
+                    np.uint32(max_results),                   # max_addresses
+                    self.gpu_address_list_buffer if self.gpu_address_list_buffer else np.uint32(0),  # address_list
+                    np.uint32(self.gpu_address_list_count),   # address_list_count
+                    np.uint32(check_addresses)                # check_addresses
+                )
+                
+                self.queue.finish()
+                
+                # Read back results
+                cl.enqueue_copy(self.queue, results_buffer, results_buf)
+                cl.enqueue_copy(self.queue, found_count, found_count_buf)
+                self.queue.finish()
+                
+                # Update seed
+                self.rng_seed += self.batch_size
+                
+                # Clean up GPU buffers to prevent memory leak
+                results_buf.release()
+                found_count_buf.release()
+                
+                # Update stats BEFORE processing results
+                addresses_checked += self.batch_size
+                with self.stats_lock:
+                    self.stats_counter += self.batch_size
+                
+                # Process found results
+                num_found = found_count[0]
+                
+                if num_found > 0:
+                    matches_found += num_found
+                    print(f"Found {num_found} matches! (Total: {matches_found})")
+                
+                # Collect all results
+                results = []
+                try:
+                    for i in range(min(num_found, max_results)):
+                        offset = i * 128
+                        
+                        # Extract key words (first 32 bytes = 8 uint32)
+                        key_words = []
+                        for j in range(8):
+                            word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
+                            key_words.append(word)
+                        key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
+                        
+                        # Extract address string (after key, null-terminated)
+                        addr_start = offset + 32
+                        addr_end = offset + 96  # Allow up to 64 chars for address
+                        addr = ''
+                        for k in range(addr_start, addr_end):
+                            if results_buffer[k] == 0:
+                                break
+                            addr += chr(results_buffer[k])
+                        
+                        # Check if this is a funded address (byte 96)
+                        is_funded = results_buffer[offset + 96] == 1
+                        
+                        results.append((addr, key_bytes, is_funded))
+                    
+                    # Sort results: funded addresses first
+                    results.sort(key=lambda x: not x[2])
+                    
+                    # Process results
+                    for addr, key_bytes, is_funded in results:
+                        if addr:
+                            # Generate WIF and public key from key_bytes
+                            key = BitcoinKey(key_bytes)
+                            wif = key.get_wif()
+                            pubkey = key.get_public_key().hex()
+                            
+                            # Report result
+                            if is_funded and self.balance_checker:
+                                # Double-check balance on CPU for accuracy
+                                balance = self.balance_checker.check_balance(addr)
+                                if balance > 0:
+                                    print(f"*** FUNDED ADDRESS FOUND! ***")
+                                    print(f"Address: {addr}")
+                                    print(f"Balance: {balance} satoshis")
+                                    print(f"WIF: {wif}")
+                            
+                            # Report result with full key information
+                            self.result_queue.put((addr, wif, pubkey))
+                            
+                except Exception as e:
+                    print(f"Error processing GPU results: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+            except Exception as e:
+                print(f"Error in GPU-only exact matching mode: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # Power throttling
+            power = self.power_percent
+            if power is not None and power < 100:
+                duty = max(0.05, min(1.0, power / 100.0))
+                work_time = time.time() - loop_start
+                sleep_time = work_time * (1.0 / duty - 1.0)
+                if sleep_time > 0:
+                    self.stop_event.wait(timeout=sleep_time)
+        
+        # Clean up buffers when loop exits
+        if hasattr(self, 'gpu_prefix_buffer_exact') and self.gpu_prefix_buffer_exact is not None:
+            try:
+                self.gpu_prefix_buffer_exact.release()
+            except Exception:
+                pass
+            self.gpu_prefix_buffer_exact = None
+        
+        print(f"GPU-only exact matching stopped. Checked {addresses_checked} addresses, found {matches_found} matches.")
+
     def _search_loop(self):
         """Main search loop using GPU for key generation and multiprocessing for CPU processing"""
         num_workers = self.cpu_cores
@@ -738,7 +1007,18 @@ class GPUGenerator:
 
         # Set up GPU balance checking if configured
         if self.balance_checker and self.balance_checker.is_loaded:
-            self._setup_gpu_balance_check()
+            # For GPU-only mode, prefer direct address list loading
+            if self.gpu_only:
+                # Try to load addresses directly to GPU memory
+                if self._setup_gpu_address_list():
+                    print("GPU-only mode: Addresses loaded directly to GPU memory")
+                else:
+                    # Fall back to bloom filter if direct loading fails
+                    print("GPU-only mode: Falling back to bloom filter")
+                    self._setup_gpu_balance_check()
+            else:
+                # For non-GPU-only mode, use bloom filter
+                self._setup_gpu_balance_check()
 
         self.running = True
 
@@ -816,13 +1096,16 @@ class GPUGenerator:
 
     def _cleanup_gpu_buffers(self):
         """Clean up all GPU buffers"""
-        for attr_name in ['gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer', 'gpu_prefix_buffer', 'temp_bloom_buffer']:
+        for attr_name in ['gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer', 'gpu_prefix_buffer', 'temp_bloom_buffer', 'gpu_address_list_buffer', 'gpu_prefix_buffer_exact']:
             if hasattr(self, attr_name) and getattr(self, attr_name) is not None:
                 try:
                     getattr(self, attr_name).release()
                 except Exception as e:
                     print(f"Error releasing {attr_name}: {e}")
                 setattr(self, attr_name, None)
+        
+        # Reset address list count
+        self.gpu_address_list_count = 0
 
     def pause(self):
         """Pause the generator"""

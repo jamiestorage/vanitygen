@@ -1061,3 +1061,99 @@ class BalanceChecker:
             buffer[offset+20:offset+54] = addr_bytes_padded
 
         return bytes(buffer)
+
+    def create_gpu_address_list(self, addresses=None, format='sorted_array'):
+        """
+        Create a GPU-native address data structure for direct GPU memory loading.
+        
+        This method creates either a sorted array or hash table of address hash160 values
+        that can be transferred directly to GPU memory for exact address matching without
+        the false positives of bloom filters.
+        
+        Args:
+            addresses: List of addresses to include. If None, uses all loaded addresses.
+            format: 'sorted_array' for binary search (memory efficient, O(log n)) or
+                   'hash_table' for direct lookup (faster, O(1), uses more memory)
+        
+        Returns:
+            dict: Dictionary containing:
+                - 'format': 'sorted_array' or 'hash_table'
+                - 'data': bytes object containing the address data
+                - 'count': number of addresses
+                - 'size_bytes': size of data in bytes
+                Returns None if no addresses available or format unsupported.
+        
+        Sorted array format:
+            - Array of 20-byte hash160 values in sorted order
+            - Total size: 20 * num_addresses bytes
+            - Lookup: Binary search O(log n)
+        
+        Hash table format (TODO):
+            - Hash table with chaining for collisions
+            - Total size: varies based on load factor
+            - Lookup: O(1) average case
+        """
+        # Get addresses
+        if addresses is None:
+            if self.funded_addresses:
+                addresses = list(self.funded_addresses)
+            elif self.address_balances:
+                addresses = list(self.address_balances.keys())
+            else:
+                print("No addresses loaded for GPU address list creation")
+                return None
+        
+        if not addresses:
+            print("Empty address list for GPU address list creation")
+            return None
+        
+        # Import hash160 for computing address hashes
+        try:
+            from .crypto_utils import hash160 as py_hash160
+        except ImportError:
+            from crypto_utils import hash160 as py_hash160
+        
+        if format == 'sorted_array':
+            # Compute hash160 for each address
+            hash160_list = []
+            for addr in addresses:
+                addr_bytes = addr.encode('ascii')
+                addr_hash = py_hash160(addr_bytes)
+                hash160_list.append(addr_hash)
+            
+            # Sort the hash160 values for binary search
+            hash160_list.sort()
+            
+            # Create binary buffer
+            buffer = bytearray()
+            for h160 in hash160_list:
+                buffer.extend(h160)
+            
+            size_bytes = len(buffer)
+            
+            # Sanity check: limit buffer size to prevent memory exhaustion
+            max_buffer_size = 2 * 1024 * 1024 * 1024  # 2GB max
+            if size_bytes > max_buffer_size:
+                print(f"WARNING: Address list would be too large ({size_bytes / (1024**3):.2f} GB)")
+                print(f"Limiting to first {max_buffer_size // 20} addresses")
+                # Truncate
+                buffer = buffer[:max_buffer_size]
+                size_bytes = max_buffer_size
+            
+            print(f"Created GPU address list (sorted array): {len(hash160_list)} addresses, {size_bytes / (1024**2):.2f} MB")
+            
+            return {
+                'format': 'sorted_array',
+                'data': bytes(buffer),
+                'count': len(hash160_list),
+                'size_bytes': size_bytes
+            }
+        
+        elif format == 'hash_table':
+            # TODO: Implement hash table format for O(1) lookup
+            print("Hash table format not yet implemented, falling back to sorted_array")
+            return self.create_gpu_address_list(addresses, format='sorted_array')
+        
+        else:
+            print(f"Unknown GPU address list format: {format}")
+            return None
