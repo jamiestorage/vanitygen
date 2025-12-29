@@ -576,25 +576,8 @@ class GPUGenerator:
                 # Process results
                 for addr, key_bytes, bloom_match in results:
                     if addr:
-                        # Verify with balance checker if available
-                        balance = 0
-                        if self.balance_checker:
-                            balance = self.balance_checker.check_balance(addr)
-
-                        # Report result
-                        if balance > 0:
-                            # Funded address found!
-                            self.result_queue.put((
-                                addr,
-                                '',  # WIF (not computed on GPU in this mode)
-                                '',  # Public key (not computed on GPU)
-                                balance
-                            ))
-                            print(f"*** FUNDED ADDRESS FOUND! {addr} ({balance} satoshis) ***")
-                        elif bloom_match:
-                            # Bloom filter matched but balance is 0 (false positive)
-                            # Still report it as a vanity match
-                            self.result_queue.put((addr, '', '', 0))
+                        # Report result (always 3 elements, balance checked by GeneratorThread)
+                        self.result_queue.put((addr, '', ''))
 
                 # Update stats
                 with self.stats_lock:
@@ -648,7 +631,7 @@ class GPUGenerator:
             # Process chunks in parallel
             try:
                 batch_results = self.pool.map(_process_keys_batch, worker_args)
-                
+
                 for results in batch_results:
                     for res in results:
                         self.result_queue.put(res)
@@ -659,6 +642,10 @@ class GPUGenerator:
 
             except Exception as e:
                 print(f"Error processing keys in parallel: {e}")
+
+            # Check stop event before power throttling
+            if self.stop_event.is_set():
+                break
 
             power = self.power_percent
             if power is not None and power < 100:
@@ -672,8 +659,20 @@ class GPUGenerator:
         if self.running:
             return
 
+        # Clean up any previous resources
+        self.stop()
         self.stop_event.clear()
+        self.pause_event.clear()
+        self.paused = False
         self.stats_counter = 0
+        self.rng_seed = int(time.time())
+
+        # Clear result queue
+        try:
+            while not self.result_queue.empty():
+                self.result_queue.get_nowait()
+        except Exception:
+            pass
 
         # Try to initialize OpenCL
         self.gpu_available = self.init_cl()
@@ -731,35 +730,46 @@ class GPUGenerator:
         self.stop_event.set()
         self.running = False
 
+        # Terminate the pool if running
         if self.pool:
-            self.pool.terminate()
-            self.pool.join()
+            try:
+                self.pool.terminate()
+                self.pool.join()
+            except Exception:
+                pass
             self.pool = None
 
+        # Wait for search thread to finish
         if self.search_thread and self.search_thread.is_alive():
-            self.search_thread.join(timeout=2.0)
-
-        # Clean up GPU buffers for balance checking
-        if hasattr(self, 'gpu_bloom_filter') and self.gpu_bloom_filter:
             try:
-                self.gpu_bloom_filter.release()
+                self.search_thread.join(timeout=3.0)
             except Exception:
                 pass
-            self.gpu_bloom_filter = None
+            self.search_thread = None
 
-        if hasattr(self, 'gpu_address_buffer') and self.gpu_address_buffer:
-            try:
-                self.gpu_address_buffer.release()
-            except Exception:
-                pass
-            self.gpu_address_buffer = None
+        # Reset pause state
+        self.paused = False
+        self.pause_event.clear()
 
-        if hasattr(self, 'found_count_buffer') and self.found_count_buffer:
-            try:
-                self.found_count_buffer.release()
-            except Exception:
-                pass
-            self.found_count_buffer = None
+        # Clean up GPU resources
+        self._cleanup_gpu_buffers()
+
+        # Clear result queue
+        try:
+            while not self.result_queue.empty():
+                self.result_queue.get_nowait()
+        except Exception:
+            pass
+
+    def _cleanup_gpu_buffers(self):
+        """Clean up all GPU buffers"""
+        for attr_name in ['gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer']:
+            if hasattr(self, attr_name) and getattr(self, attr_name) is not None:
+                try:
+                    getattr(self, attr_name).release()
+                except Exception:
+                    pass
+                setattr(self, attr_name, None)
 
     def pause(self):
         """Pause the generator"""

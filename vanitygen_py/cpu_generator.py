@@ -47,6 +47,19 @@ class CPUGenerator:
         self.paused = False
 
     def start(self):
+        # Clean up any previous resources
+        self.stop()
+        self.stop_event.clear()
+        self.pause_event.clear()
+        self.paused = False
+
+        # Clear result queue
+        try:
+            while not self.result_queue.empty():
+                self.result_queue.get_nowait()
+        except Exception:
+            pass
+
         for _ in range(self.cores):
             p = multiprocessing.Process(target=worker, args=(
                 self.prefix, self.addr_type, self.result_queue, self.stop_event,
@@ -58,7 +71,12 @@ class CPUGenerator:
     def stop(self):
         self.stop_event.set()
         for p in self.processes:
-            p.join()
+            try:
+                p.join(timeout=1.0)
+            except Exception:
+                pass
+        self.processes = []
+        self.paused = False
 
     def pause(self):
         """Pause the generator"""
