@@ -5,6 +5,7 @@
 pybind11>=2.10.1
 pyopencl>=2022.1  # Requires OpenCL headers
 numpy>=1.21.0     # Required for OpenCL buffer operations
+psutil>=5.9.0    # Optional: For system memory checking (prevents OOM)
 ecdsa==0.18.0
 base58==2.1.1
 bech32==1.2.0

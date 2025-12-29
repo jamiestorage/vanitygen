@@ -5,6 +5,12 @@ import os
 import struct
 import multiprocessing
 
+# Optional import for system memory checking
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 # Handle both module and direct execution
 try:
     from .bitcoin_keys import BitcoinKey
@@ -223,6 +229,26 @@ class GPUGenerator:
                 print(f"[DEBUG] _setup_gpu_address_list() - Required: {required_mem * 2 / (1024**2):.2f} MB (including overhead)")
                 print(f"[DEBUG] _setup_gpu_address_list() - Available: {device_mem / (1024**2):.2f} MB")
                 return False
+            
+            # Check system memory availability to prevent OOM
+            if psutil is not None:
+                try:
+                    system_mem = psutil.virtual_memory().total
+                    available_mem = psutil.virtual_memory().available
+                    
+                    # Be conservative: require at least 3x the address list size in available memory
+                    # to account for other system processes and overhead
+                    memory_safety_margin = 3
+                    if required_mem * memory_safety_margin > available_mem:
+                        print(f"[DEBUG] _setup_gpu_address_list() - WARNING: Insufficient system memory!")
+                        print(f"[DEBUG] _setup_gpu_address_list() - Required safety margin: {required_mem * memory_safety_margin / (1024**3):.2f} GB")
+                        print(f"[DEBUG] _setup_gpu_address_list() - Available system memory: {available_mem / (1024**3):.2f} GB")
+                        print(f"[DEBUG] _setup_gpu_address_list() - Total system memory: {system_mem / (1024**3):.2f} GB")
+                        return False
+                except Exception as e:
+                    print(f"[DEBUG] _setup_gpu_address_list() - WARNING: Could not check system memory: {e}")
+            else:
+                print("[DEBUG] _setup_gpu_address_list() - WARNING: psutil not available, cannot check system memory")
             
             # Allocate GPU buffer for address list
             mf = cl.mem_flags
@@ -491,6 +517,12 @@ class GPUGenerator:
                     self.queue.finish()
 
                     print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Executing generate_and_check kernel with {self.batch_size} items...")
+
+                    # Create GPU buffer for prefix to avoid INVALID_ARG_SIZE
+                    prefix_buffer = np.zeros(64, dtype=np.uint8)  # Fixed size buffer for alignment
+                    prefix_buffer[:prefix_len] = prefix_bytes
+                    gpu_prefix_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=prefix_buffer)
+
                     # Execute the combined kernel
                     self.kernel_check(
                         self.queue, (self.batch_size,), None,
@@ -501,11 +533,14 @@ class GPUGenerator:
                         np.uint32(self.batch_size),  # batch_size
                         self.gpu_bloom_filter,  # bloom_filter
                         np.uint32(self.bloom_filter_size),  # filter_size
-                        np.frombuffer(prefix_bytes, dtype=np.uint8),  # prefix
+                        gpu_prefix_buffer,  # prefix (must be a cl.Buffer)
                         np.int32(prefix_len),  # prefix_len
                         self.gpu_address_buffer,  # addresses_buffer
                         np.uint32(max_results)  # max_addresses
                     )
+
+                    # Clean up prefix buffer to prevent memory leak
+                    gpu_prefix_buffer.release()
 
                     print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Waiting for kernel completion...")
                     self.queue.finish()

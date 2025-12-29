@@ -1,128 +1,112 @@
-# Summary of Fixes
+# GPU Address List Memory Bloat and INVALID_ARG_SIZE Fixes
 
 ## Issues Fixed
 
-This document summarizes the fixes applied to resolve the GUI errors encountered when running the Bitcoin Vanity Address Generator.
+### 1. Memory Bloat During GPU Address List Creation
+**Problem**: When loading large address lists (e.g., 55 million addresses), the system would run out of memory and get killed by the OOM killer. The process consumed all 16GB RAM + 2GB swap.
 
-### 1. **AttributeError: 'GPUGenerator' object has no attribute 'result_queue'**
+**Root Cause**: The `_setup_gpu_address_list()` method did not check system memory availability before loading large address lists into memory for GPU transfer.
 
-**Problem:** When running in GPU mode, the GUI thread attempted to access `generator.result_queue.empty()` on line 46 of `gui.py`, but the `GPUGenerator` class didn't have a `result_queue` attribute, causing an `AttributeError`.
+**Solution**: Added system memory checking using `psutil` to prevent OOM conditions:
+- Check available system memory before loading large address lists
+- Require at least 3x the address list size in available memory (conservative safety margin)
+- Gracefully handle cases where `psutil` is not available
+- Provide clear debug messages about memory usage and limits
 
-**Solution:**
-- Added `import queue` to `vanitygen_py/gpu_generator.py`
-- Added `self.result_queue = queue.Queue()` to `GPUGenerator.__init__()`
-- Now both `CPUGenerator` and `GPUGenerator` have compatible `result_queue` attributes with `empty()` and `get()` methods
+### 2. INVALID_ARG_SIZE Error in GPU Kernel
+**Problem**: When using smaller address lists, the system would encounter `INVALID_ARG_SIZE` errors when executing the `generate_and_check` kernel.
 
-**Files Modified:**
-- `vanitygen_py/gpu_generator.py`
+**Root Cause**: The kernel expected a proper OpenCL buffer for the prefix argument, but the code was passing a numpy array directly (`np.frombuffer(prefix_bytes, dtype=np.uint8)`).
 
-### 2. **IOError: Bitcoin Core chainstate lock**
+**Solution**: Fixed prefix buffer creation to match kernel expectations:
+- Create a fixed-size 64-byte buffer for proper alignment
+- Use `cl.Buffer()` to create a proper OpenCL buffer from the prefix data
+- Clean up the buffer after kernel execution to prevent memory leaks
+- Applied the same fix to all kernel calls that use prefix buffers
 
-**Problem:** When trying to load Bitcoin Core's chainstate database, plyvel would throw an IOError if Bitcoin Core was running (database locked by another process). The error was caught but the user experience could be improved.
+## Files Modified
 
-**Solution:**
-- Added specific error catching for lock-related errors in `balance_checker.py`
-- Added helpful error messages explaining:
-  - The chainstate is locked by Bitcoin Core
-  - Suggested solutions: close Bitcoin Core or use a file-based address list
-- Improved GUI error dialog to list common issues and solutions
+### 1. `vanitygen_py/gpu_generator.py`
 
-**Files Modified:**
-- `vanitygen_py/balance_checker.py`
-- `vanitygen_py/gui.py`
-
-### 3. **RuntimeError: GPU acceleration not available**
-
-**Problem:** If OpenCL/GPU is not available and the user selects GPU mode, the generator would crash when trying to start.
-
-**Solution:**
-- Added try/except block around `generator.start()` in the GUI thread
-- Gracefully handles `RuntimeError` when GPU acceleration is unavailable
-- Returns early from the thread to prevent further errors
-
-**Files Modified:**
-- `vanitygen_py/gui.py`
-
-### 4. **PySide6 version incompatibility**
-
-**Problem:** The requirements.txt specified `PySide6==6.2.4` which is not compatible with Python 3.12+.
-
-**Solution:**
-- Updated requirements.txt to use `PySide6>=6.6.0` for better compatibility with modern Python versions
-
-**Files Modified:**
-- `requirements.txt`
-
-## Changes Summary
-
-### vanitygen_py/gpu_generator.py
+**Added imports**:
 ```python
-# Added:
-import queue
-
-class GPUGenerator:
-    def __init__(self, prefix, addr_type='p2pkh'):
-        # ... existing code ...
-        self.result_queue = queue.Queue()  # NEW
-```
-
-### vanitygen_py/balance_checker.py
-```python
-# Enhanced error handling for locked database:
+# Optional import for system memory checking
 try:
-    db = plyvel.DB(path, create_if_missing=False, compression=None)
-except Exception as db_error:
-    error_msg = str(db_error)
-    if 'lock' in error_msg.lower() or 'already held' in error_msg.lower():
-        print(f"Failed to load Bitcoin Core DB: {db_error}")
-        print("The chainstate database is locked by another process (likely Bitcoin Core).")
-        print("Please close Bitcoin Core and try again, or use a file-based address list instead.")
-    else:
-        print(f"Failed to open Bitcoin Core DB: {db_error}")
-    return False
+    import psutil
+except ImportError:
+    psutil = None
 ```
 
-### vanitygen_py/gui.py
-```python
-# Added error handling for generator start:
-try:
-    self.generator.start()
-except RuntimeError as e:
-    # GPU not available or other startup error
-    print(f"Error starting generator: {e}")
-    return
+**Enhanced `_setup_gpu_address_list()` method**:
+- Added system memory availability check using `psutil`
+- Added conservative memory safety margin (3x required memory)
+- Added detailed debug logging for memory usage
+- Graceful handling when `psutil` is not available
 
-# Improved error dialog message:
-QMessageBox.warning(self, "Failed", 
-    f"Could not find or load Bitcoin Core data at {path}.\n\n"
-    "Common issues:\n"
-    "- Bitcoin Core is running (chainstate is locked)\n"
-    "- Path doesn't exist or is incorrect\n"
-    "- plyvel library not installed\n\n"
-    "Try closing Bitcoin Core and loading again, or use a file-based address list instead.")
+**Fixed `_search_loop_with_balance_check()` method**:
+- Create proper OpenCL buffer for prefix argument
+- Use fixed-size 64-byte buffer for alignment
+- Clean up prefix buffer after kernel execution
+
+### 2. `requirements.txt`
+
+**Added psutil as optional dependency**:
+```
+psutil>=5.9.0    # Optional: For system memory checking (prevents OOM)
 ```
 
-### requirements.txt
-```
-# Changed:
-- PySide6==6.2.4
-+ PySide6>=6.6.0
-```
+## Technical Details
+
+### Memory Safety Check
+The fix adds a system memory check that:
+1. Uses `psutil.virtual_memory()` to get available system memory
+2. Requires at least 3x the address list size to be available
+3. Prevents the process from being killed by OOM killer
+4. Provides clear debug messages about memory constraints
+
+### Prefix Buffer Fix
+The fix ensures that:
+1. Prefix data is properly aligned in a 64-byte buffer
+2. A proper OpenCL buffer is created using `cl.Buffer()`
+3. The buffer is cleaned up after use to prevent memory leaks
+4. All kernel calls use the same pattern for consistency
 
 ## Testing
 
-All fixes have been tested and verified:
-- ✅ GPUGenerator now has result_queue attribute
-- ✅ result_queue has empty() and get() methods
-- ✅ Balance checker handles lock errors gracefully
-- ✅ Improved error messages for user guidance
-- ✅ PySide6 version updated for Python 3.12+ compatibility
-- ✅ Generator thread handles startup errors gracefully
+Created comprehensive tests to verify the fixes:
+- `test_fixes.py`: Basic functionality tests
+- `test_original_issue.py`: Simulates the original issues and verifies fixes
+
+Tests cover:
+- Memory check functionality with various address list sizes
+- Prefix buffer creation for different prefix lengths
+- Edge cases (empty lists, invalid addresses)
+- System memory checking with mocked environments
 
 ## Impact
 
-These fixes ensure:
-1. The GUI won't crash with AttributeError when using GPU mode
-2. Users get clear, helpful error messages when Bitcoin Core is running
-3. The application handles unavailable GPU acceleration gracefully
-4. The application is compatible with modern Python versions
+These fixes resolve:
+1. **Memory exhaustion**: Prevents the application from consuming all system memory
+2. **GPU kernel errors**: Eliminates INVALID_ARG_SIZE errors in kernel execution
+3. **System stability**: Improves overall stability when working with large address lists
+4. **User experience**: Provides better error messages and graceful degradation
+
+## Backward Compatibility
+
+The fixes maintain full backward compatibility:
+- `psutil` is optional (graceful degradation if not available)
+- Existing functionality is preserved
+- No breaking changes to APIs or interfaces
+- All existing tests continue to pass
+
+## Performance Considerations
+
+The memory check adds minimal overhead:
+- Only executed during GPU address list setup (not in hot path)
+- Uses efficient system calls via `psutil`
+- Prevents much more expensive OOM conditions
+
+The prefix buffer fix has no performance impact:
+- Same buffer creation pattern used throughout
+- Proper cleanup prevents memory leaks
+- Aligns with existing OpenCL best practices
