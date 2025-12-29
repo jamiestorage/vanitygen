@@ -922,8 +922,14 @@ class BalanceChecker:
         GPU-side filtering - addresses that don't match the bloom filter
         can be safely skipped, while matches need CPU verification.
 
-        The bloom filter is computed from the hash160 (first 20 bytes) of each
-        address for efficient GPU comparison.
+        IMPORTANT: The bloom filter is computed from the hash160 (RIPEMD160 of SHA256)
+        of each address, NOT the address string itself. This matches the GPU kernel's
+        expectations in gpu_kernel.cl where addr_hash is constructed from hash160 bytes.
+
+        GPU kernel matching (gpu_kernel.cl lines 475-478):
+            uint3 addr_hash = (uint3)(hash20[0] | (hash20[1] << 8) | (hash20[2] << 16),
+                                       hash20[3] | (hash20[4] << 8) | (hash20[5] << 16),
+                                       hash20[6] | (hash20[7] << 8) | (hash20[8] << 16));
 
         Args:
             addresses: List of addresses to include in filter.
@@ -955,6 +961,21 @@ class BalanceChecker:
             print("Empty address list for bloom filter creation")
             return None, None
 
+        # Import hash160 for computing address hashes
+        try:
+            from .crypto_utils import hash160 as py_hash160
+        except ImportError:
+            from crypto_utils import hash160 as py_hash160
+
+        # Import base58 decode to get proper hash160 from address
+        try:
+            from .crypto_utils import base58_decode
+        except ImportError:
+            try:
+                from crypto_utils import base58_decode
+            except ImportError:
+                base58_decode = None
+
         # Calculate filter size
         num_items = len(addresses)
 
@@ -973,25 +994,73 @@ class BalanceChecker:
         # Initialize bloom filter
         bloom_filter = bytearray(byte_size)
 
+        # Bloom hash function matching GPU kernel (gpu_kernel.cl lines 65-74)
+        def bloom_hash(data_x, data_y, data_z, seed, m):
+            """
+            Match the GPU's bloom_hash function exactly.
+            
+            GPU kernel code:
+                uint h = data.x ^ (seed * 0x9e3779b9);
+                h = (h ^ (h >> 16)) * 0x85ebca6b;
+                h = (h ^ (h >> 13)) * 0xc2b2ae35;
+                h ^= data.y * seed;
+                h = (h ^ (h >> 16)) * 0x85ebca6b;
+                h = (h ^ (h >> 13)) * 0xc2b2ae35;
+                h ^= data.z * seed * 2;
+                return h % m;
+            """
+            h = data_x ^ (seed * 0x9e3779b9) & 0xFFFFFFFF
+            h = ((h ^ (h >> 16)) * 0x85ebca6b) & 0xFFFFFFFF
+            h = ((h ^ (h >> 13)) * 0xc2b2ae35) & 0xFFFFFFFF
+            h ^= (data_y * seed) & 0xFFFFFFFF
+            h = ((h ^ (h >> 16)) * 0x85ebca6b) & 0xFFFFFFFF
+            h = ((h ^ (h >> 13)) * 0xc2b2ae35) & 0xFFFFFFFF
+            h ^= (data_z * seed * 2) & 0xFFFFFFFF
+            return h % m
+
         # For each address, compute hash160 and set bits
+        processed = 0
         for addr in addresses:
-            # Compute hash160 of address (for GPU compatibility)
-            # We'll use the raw bytes to determine which bits to set
-            addr_bytes = addr.encode('ascii') if isinstance(addr, str) else addr
+            try:
+                # Get hash160 of address using base58 decode (same as GPU does)
+                # GPU extracts hash160 from the address when generating addresses
+                # For the bloom filter, we need to decode the address to get its hash160
+                if base58_decode:
+                    # Decode base58 address to get version + hash160 + checksum
+                    decoded = base58_decode(addr)
+                    if decoded and len(decoded) >= 21:
+                        # Skip version byte, take next 20 bytes as hash160
+                        hash160_bytes = decoded[1:21]
+                    else:
+                        # Fallback: compute hash160 of ASCII address (for backward compat)
+                        addr_bytes = addr.encode('ascii') if isinstance(addr, str) else addr
+                        hash160_bytes = py_hash160(addr_bytes)
+                else:
+                    # Fallback: compute hash160 of ASCII address
+                    addr_bytes = addr.encode('ascii') if isinstance(addr, str) else addr
+                    hash160_bytes = py_hash160(addr_bytes)
 
-            # Create a simple hash from the address
-            h1 = 0
-            h2 = 0
-            for i, b in enumerate(addr_bytes):
-                h1 = ((h1 * 31) + b) & 0xFFFFFFFF
-                h2 = ((h2 * 31) + b) ^ (h1 << 7) & 0xFFFFFFFF
+                if len(hash160_bytes) < 9:
+                    continue
 
-            # Set bits using multiple hash functions
-            for i in range(num_hashes):
-                bit_idx = (h1 + i * h2) % num_bits
-                bloom_filter[bit_idx // 8] |= (1 << (bit_idx % 8))
+                # Construct uint3 matching GPU kernel (gpu_kernel.cl lines 475-478)
+                # The GPU constructs this from hash160 bytes when checking
+                data_x = hash160_bytes[0] | (hash160_bytes[1] << 8) | (hash160_bytes[2] << 16)
+                data_y = hash160_bytes[3] | (hash160_bytes[4] << 8) | (hash160_bytes[5] << 16)
+                data_z = hash160_bytes[6] | (hash160_bytes[7] << 8) | (hash160_bytes[8] << 16)
 
-        print(f"Created bloom filter with {byte_size} bytes ({num_bits} bits) for {num_items} addresses")
+                # Set bits using multiple hash functions (matching GPU kernel)
+                for i in range(num_hashes):
+                    bit_idx = bloom_hash(data_x, data_y, data_z, i, num_bits)
+                    bloom_filter[bit_idx // 8] |= (1 << (bit_idx % 8))
+
+                processed += 1
+
+            except Exception as e:
+                # Skip problematic addresses
+                continue
+
+        print(f"Created bloom filter with {byte_size} bytes ({num_bits} bits) for {processed}/{num_items} addresses")
         print(f"Expected false positive rate: ~{0.5 ** num_hashes * 100:.2f}%")
 
         return bytes(bloom_filter), num_bits
@@ -1003,6 +1072,10 @@ class BalanceChecker:
         This creates a compact binary representation of addresses that can be
         transferred to GPU memory for exact matching after bloom filter pre-filtering.
 
+        IMPORTANT: This method decodes the base58 address to extract the hash160 payload,
+        NOT compute hash160 of the address string. This matches how Bitcoin addresses
+        are structured: base58check(version + hash160 + checksum).
+
         Args:
             addresses: List of addresses to include. If None, uses all loaded addresses.
 
@@ -1012,7 +1085,7 @@ class BalanceChecker:
 
         Buffer format:
             For each address (64 bytes total):
-            - First 20 bytes: hash160 of address
+            - First 20 bytes: hash160 extracted from address (via base58 decode)
             - Next 34 bytes: address string (null-padded)
             - Next 10 bytes: reserved/alignment
         """
@@ -1038,28 +1111,45 @@ class BalanceChecker:
             addresses = addresses[:max_buffer_size // 64]
             buffer_size = 64 * len(addresses)
 
-        # Import hash160 for computing address hashes
+        # Import base58 decode to properly extract hash160 from address
         try:
-            from .crypto_utils import hash160 as py_hash160
+            from .crypto_utils import base58_decode
         except ImportError:
-            from crypto_utils import hash160 as py_hash160
+            try:
+                from crypto_utils import base58_decode
+            except ImportError:
+                base58_decode = None
 
         # Build buffer
         buffer = bytearray(buffer_size)
+        processed = 0
         for i, addr in enumerate(addresses):
             offset = i * 64
 
-            # Compute hash160 of address for GPU matching
-            addr_bytes = addr.encode('ascii')
-            addr_hash = py_hash160(addr_bytes)
+            # Decode base58 address to extract hash160
+            # This matches how the GPU kernel computes hash160 when generating addresses
+            if base58_decode:
+                decoded = base58_decode(addr)
+                if decoded and len(decoded) >= 21:
+                    # Skip version byte (1), take hash160 (20 bytes)
+                    addr_hash = decoded[1:21]
+                else:
+                    # Fallback: skip this address or use zeros
+                    addr_hash = b'\x00' * 20
+            else:
+                # Fallback: skip this address or use zeros
+                addr_hash = b'\x00' * 20
 
             # Store hash160 (20 bytes)
             buffer[offset:offset+20] = addr_hash
 
             # Store address string (34 bytes, null-padded)
+            addr_bytes = addr.encode('ascii')
             addr_bytes_padded = addr_bytes.ljust(34, b'\x00')
             buffer[offset+20:offset+54] = addr_bytes_padded
+            processed += 1
 
+        print(f"Created GPU address buffer for {processed} addresses ({buffer_size / 1024:.1f} KB)")
         return bytes(buffer)
 
     def create_gpu_address_list(self, addresses=None, format='sorted_array'):
@@ -1069,6 +1159,10 @@ class BalanceChecker:
         This method creates either a sorted array or hash table of address hash160 values
         that can be transferred directly to GPU memory for exact address matching without
         the false positives of bloom filters.
+        
+        IMPORTANT: This method decodes the base58 address to extract the hash160 payload,
+        NOT compute hash160 of the address string. This matches how Bitcoin addresses
+        are structured and how the GPU kernel computes addresses.
         
         Args:
             addresses: List of addresses to include. If None, uses all loaded addresses.
@@ -1107,19 +1201,30 @@ class BalanceChecker:
             print("Empty address list for GPU address list creation")
             return None
         
-        # Import hash160 for computing address hashes
+        # Import base58 decode to properly extract hash160 from address
         try:
-            from .crypto_utils import hash160 as py_hash160
+            from .crypto_utils import base58_decode
         except ImportError:
-            from crypto_utils import hash160 as py_hash160
+            try:
+                from crypto_utils import base58_decode
+            except ImportError:
+                base58_decode = None
         
         if format == 'sorted_array':
-            # Compute hash160 for each address
+            # Decode each address and extract hash160
             hash160_list = []
             for addr in addresses:
-                addr_bytes = addr.encode('ascii')
-                addr_hash = py_hash160(addr_bytes)
-                hash160_list.append(addr_hash)
+                if base58_decode:
+                    decoded = base58_decode(addr)
+                    if decoded and len(decoded) >= 21:
+                        # Skip version byte (1), take hash160 (20 bytes)
+                        addr_hash = decoded[1:21]
+                        hash160_list.append(addr_hash)
+                # If no base58_decode, skip this address (no fallback for sorted array)
+            
+            if not hash160_list:
+                print("No valid addresses could be decoded for GPU list creation")
+                return None
             
             # Sort the hash160 values for binary search
             hash160_list.sort()
