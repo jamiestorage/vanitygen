@@ -50,6 +50,7 @@ class LoadBitcoinCoreThread(QThread):
 class GeneratorThread(QThread):
     stats_updated = Signal(int, float)
     address_found = Signal(str, str, str, float, bool)
+    error = Signal(str)
 
     def __init__(
         self,
@@ -107,44 +108,54 @@ class GeneratorThread(QThread):
         except RuntimeError as e:
             # GPU not available or other startup error
             print(f"Error starting generator: {e}")
+            self.error.emit(f"Failed to start generator: {e}")
             return
-            
+
         start_time = time.time()
         total_keys = 0
-        
+
         while self.running:
-            time.sleep(1)
-            new_keys = self.generator.get_stats()
-            total_keys += new_keys
-            elapsed = time.time() - start_time
-            speed = total_keys / elapsed if elapsed > 0 else 0
-            self.stats_updated.emit(total_keys, speed)
-
-            # Check results
             try:
-                while not self.generator.result_queue.empty():
-                    result = self.generator.result_queue.get_nowait()
-                    # Handle both 3-tuple and 4-tuple results for backward compatibility
-                    if len(result) == 3:
-                        addr, wif, pubkey = result
-                    elif len(result) == 4:
-                        addr, wif, pubkey, _ = result  # Ignore balance if already computed
-                    else:
-                        print(f"Unexpected result format: {result}")
-                        continue
+                time.sleep(1)
+                new_keys = self.generator.get_stats()
+                total_keys += new_keys
+                elapsed = time.time() - start_time
+                speed = total_keys / elapsed if elapsed > 0 else 0
+                self.stats_updated.emit(total_keys, speed)
 
-                    # Check balance
-                    balance, is_in_funded_list = self.balance_checker.check_balance_and_membership(addr)
-                    self.address_found.emit(addr, wif, pubkey, balance, is_in_funded_list)
-                    if balance > 0 and not self.auto_resume:
-                        # Pause if funded address found (as per requirements)
-                        self.running = False
-                        self.generator.stop()
-                        break
+                # Check results
+                try:
+                    while not self.generator.result_queue.empty():
+                        result = self.generator.result_queue.get_nowait()
+                        # Handle both 3-tuple and 4-tuple results for backward compatibility
+                        if len(result) == 3:
+                            addr, wif, pubkey = result
+                        elif len(result) == 4:
+                            addr, wif, pubkey, _ = result  # Ignore balance if already computed
+                        else:
+                            print(f"Unexpected result format: {result}")
+                            continue
+
+                        # Check balance
+                        balance, is_in_funded_list = self.balance_checker.check_balance_and_membership(addr)
+                        self.address_found.emit(addr, wif, pubkey, balance, is_in_funded_list)
+                        if balance > 0 and not self.auto_resume:
+                            # Pause if funded address found (as per requirements)
+                            self.running = False
+                            self.generator.stop()
+                            break
+                except Exception as e:
+                    print(f"Error processing results: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.error.emit(f"Error processing results: {e}")
+
             except Exception as e:
-                print(f"Error processing results: {e}")
+                print(f"Error in generator thread: {e}")
                 import traceback
                 traceback.print_exc()
+                self.error.emit(f"Generator thread error: {e}")
+                break
 
     def stop(self):
         self.running = False
@@ -627,6 +638,7 @@ Whoever has this key controls these funds.<br><br>
         )
         self.gen_thread.stats_updated.connect(self.update_stats)
         self.gen_thread.address_found.connect(self.on_address_found)
+        self.gen_thread.error.connect(self.on_gen_error)
         self.gen_thread.finished.connect(self.on_gen_finished)
         
         self.gen_thread.start()
@@ -762,6 +774,11 @@ Whoever has this key controls these funds.<br><br>
                 self.log_output.append("Funded address found, auto-resume is ON - continuing generation...")
                 print("Funded address found, auto-resume is ON")
 
+    def on_gen_error(self, error_msg):
+        """Handle generator thread errors"""
+        self.log_output.append(f"ERROR: {error_msg}")
+        QMessageBox.critical(self, "Generator Error", f"An error occurred:\n\n{error_msg}")
+        
     def on_gen_finished(self):
         self.start_btn.setText("Start Generation")
         self.pause_btn.setEnabled(False)

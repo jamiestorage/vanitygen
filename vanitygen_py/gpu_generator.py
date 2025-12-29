@@ -144,12 +144,12 @@ class GPUGenerator:
             mf = cl.mem_flags
 
             # Bloom filter buffer
-            self.gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                              hostbuf=np.frombuffer(self.bloom_filter, dtype=np.uint8))
-
+            bloom_data = np.frombuffer(self.bloom_filter, dtype=np.uint8)
+            self.gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bloom_data)
+            
             # Address buffer for verification (contains hash160 + address pairs)
-            self.gpu_address_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                                hostbuf=np.frombuffer(self.address_buffer, dtype=np.uint8))
+            addr_data = np.frombuffer(self.address_buffer, dtype=np.uint8)
+            self.gpu_address_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=addr_data)
 
             # Found count buffer (for tracking potential matches)
             self.found_count_buffer = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
@@ -161,6 +161,8 @@ class GPUGenerator:
             print(f"Failed to setup GPU balance checking: {e}")
             import traceback
             traceback.print_exc()
+            # Clean up any partially created buffers
+            self._cleanup_gpu_buffers()
 
     def _setup_gpu_address_list(self):
         """
@@ -217,6 +219,8 @@ class GPUGenerator:
             print(f"Failed to setup GPU address list: {e}")
             import traceback
             traceback.print_exc()
+            # Clean up any partially created buffers
+            self._cleanup_gpu_buffers()
             return False
 
     def init_cl(self):
@@ -304,6 +308,8 @@ class GPUGenerator:
             print(f"OpenCL initialization failed: {e}")
             import traceback
             traceback.print_exc()
+            # Ensure all resources are cleaned up
+            self._cleanup_gpu_buffers()
             return False
 
     def is_available(self):
@@ -397,6 +403,9 @@ class GPUGenerator:
         prefix_bytes = np.frombuffer(self.prefix.encode('ascii'), dtype=np.uint8)
         prefix_len = len(self.prefix)
 
+        # Track GPU buffers for cleanup
+        gpu_buffers = []
+
         while not self.stop_event.is_set():
             # Check if paused
             if self.pause_event.is_set():
@@ -413,10 +422,12 @@ class GPUGenerator:
 
                 # Create GPU buffer for output keys
                 output_keys_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, output_keys.nbytes)
+                gpu_buffers.append(output_keys_buf)
 
                 # Ensure buffers are on GPU
                 results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
                 found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
+                gpu_buffers.extend([results_buf, found_count_buf])
 
                 # Reset found count on GPU
                 cl.enqueue_copy(self.queue, found_count_buf, found_count)
@@ -449,9 +460,12 @@ class GPUGenerator:
                 self.rng_seed += self.batch_size
 
                 # Clean up GPU buffers to prevent memory leak
-                output_keys_buf.release()
-                results_buf.release()
-                found_count_buf.release()
+                for buf in gpu_buffers:
+                    try:
+                        buf.release()
+                    except Exception:
+                        pass
+                gpu_buffers.clear()
 
                 # Process found results
                 num_found = found_count[0]
@@ -606,6 +620,9 @@ class GPUGenerator:
             self.temp_bloom_buffer = gpu_bloom_filter
             del dummy_buffer
 
+        # Track GPU buffers for cleanup
+        gpu_buffers = []
+
         while not self.stop_event.is_set():
             # Check if paused
             if self.pause_event.is_set():
@@ -620,6 +637,7 @@ class GPUGenerator:
                 # Create output buffer for results
                 results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
                 found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
+                gpu_buffers.extend([results_buf, found_count_buf])
 
                 # Reset found count on GPU
                 cl.enqueue_copy(self.queue, found_count_buf, found_count)
@@ -651,8 +669,12 @@ class GPUGenerator:
                 self.rng_seed += self.batch_size
 
                 # Clean up GPU buffers to prevent memory leak
-                results_buf.release()
-                found_count_buf.release()
+                for buf in gpu_buffers:
+                    try:
+                        buf.release()
+                    except Exception:
+                        pass
+                gpu_buffers.clear()
 
                 # Update stats BEFORE processing results to ensure counter increments even on errors
                 with self.stats_lock:
@@ -719,6 +741,14 @@ class GPUGenerator:
                 sleep_time = work_time * (1.0 / duty - 1.0)
                 if sleep_time > 0:
                     self.stop_event.wait(timeout=sleep_time)
+
+        # Clean up any remaining GPU buffers
+        for buf in gpu_buffers:
+            try:
+                buf.release()
+            except Exception:
+                pass
+        gpu_buffers.clear()
 
         # Clean up temporary bloom filter buffer when loop exits
         if hasattr(self, 'temp_bloom_buffer') and self.temp_bloom_buffer is not None:
@@ -790,42 +820,47 @@ class GPUGenerator:
                 # Create output buffer for results
                 results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
                 found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
-                
+
                 # Reset found count on GPU
                 cl.enqueue_copy(self.queue, found_count_buf, found_count)
                 self.queue.finish()
-                
+
                 # Determine if we should check addresses
                 check_addresses = 1 if self.gpu_address_list_buffer is not None else 0
-                
+
                 # Execute the exact matching kernel
                 self.kernel_full_exact(
-                    self.queue, (self.batch_size,), None,
-                    results_buf,                              # found_addresses
-                    found_count_buf,                          # found_count
-                    np.uint64(self.rng_seed),                 # seed
-                    np.uint32(self.batch_size),               # batch_size
-                    gpu_prefix_buffer,                        # prefix
-                    np.int32(prefix_len),                     # prefix_len
-                    np.uint32(max_results),                   # max_addresses
-                    self.gpu_address_list_buffer if self.gpu_address_list_buffer else np.uint32(0),  # address_list
-                    np.uint32(self.gpu_address_list_count),   # address_list_count
-                    np.uint32(check_addresses)                # check_addresses
+                   self.queue, (self.batch_size,), None,
+                   results_buf,                              # found_addresses
+                   found_count_buf,                          # found_count
+                   np.uint64(self.rng_seed),                 # seed
+                   np.uint32(self.batch_size),               # batch_size
+                   gpu_prefix_buffer,                        # prefix
+                   np.int32(prefix_len),                     # prefix_len
+                   np.uint32(max_results),                   # max_addresses
+                   self.gpu_address_list_buffer if self.gpu_address_list_buffer else np.uint32(0),  # address_list
+                   np.uint32(self.gpu_address_list_count),   # address_list_count
+                   np.uint32(check_addresses)                # check_addresses
                 )
-                
+
                 self.queue.finish()
-                
+
                 # Read back results
                 cl.enqueue_copy(self.queue, results_buffer, results_buf)
                 cl.enqueue_copy(self.queue, found_count, found_count_buf)
                 self.queue.finish()
-                
+
                 # Update seed
                 self.rng_seed += self.batch_size
-                
+
                 # Clean up GPU buffers to prevent memory leak
-                results_buf.release()
-                found_count_buf.release()
+                try:
+                   results_buf.release()
+                   found_count_buf.release()
+                except Exception as e:
+                   print(f"Error releasing GPU buffers: {e}")
+                   import traceback
+                   traceback.print_exc()
                 
                 # Update stats BEFORE processing results
                 addresses_checked += self.batch_size
@@ -997,7 +1032,13 @@ class GPUGenerator:
             pass
 
         # Try to initialize OpenCL
-        self.gpu_available = self.init_cl()
+        try:
+            self.gpu_available = self.init_cl()
+        except Exception as e:
+            print(f"Failed to initialize OpenCL: {e}")
+            import traceback
+            traceback.print_exc()
+            self.gpu_available = False
 
         if not self.gpu_available:
             raise RuntimeError("GPU acceleration not available. Please ensure:\n"
@@ -1068,16 +1109,18 @@ class GPUGenerator:
             try:
                 self.pool.terminate()
                 self.pool.join()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error terminating pool: {e}")
             self.pool = None
 
         # Wait for search thread to finish
         if self.search_thread and self.search_thread.is_alive():
             try:
                 self.search_thread.join(timeout=3.0)
-            except Exception:
-                pass
+                if self.search_thread.is_alive():
+                    print("Warning: Search thread did not terminate within timeout")
+            except Exception as e:
+                print(f"Error joining search thread: {e}")
             self.search_thread = None
 
         # Reset pause state
@@ -1085,18 +1128,31 @@ class GPUGenerator:
         self.pause_event.clear()
 
         # Clean up GPU resources
-        self._cleanup_gpu_buffers()
+        try:
+            self._cleanup_gpu_buffers()
+        except Exception as e:
+            print(f"Error cleaning up GPU buffers: {e}")
+            import traceback
+            traceback.print_exc()
 
         # Clear result queue
         try:
             while not self.result_queue.empty():
                 self.result_queue.get_nowait()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error clearing result queue: {e}")
 
     def _cleanup_gpu_buffers(self):
         """Clean up all GPU buffers"""
-        for attr_name in ['gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer', 'gpu_prefix_buffer', 'temp_bloom_buffer', 'gpu_address_list_buffer', 'gpu_prefix_buffer_exact']:
+        # List of all possible GPU buffer attributes
+        buffer_attrs = [
+            'gpu_bloom_filter', 'gpu_address_buffer', 'found_count_buffer', 
+            'gpu_prefix_buffer', 'temp_bloom_buffer', 'gpu_address_list_buffer', 
+            'gpu_prefix_buffer_exact', 'gpu_bloom_filter_exact', 'gpu_results_buffer',
+            'gpu_address_buffer_exact', 'gpu_prefix_buffer', 'gpu_bloom_filter'
+        ]
+        
+        for attr_name in buffer_attrs:
             if hasattr(self, attr_name) and getattr(self, attr_name) is not None:
                 try:
                     getattr(self, attr_name).release()
@@ -1106,6 +1162,12 @@ class GPUGenerator:
         
         # Reset address list count
         self.gpu_address_list_count = 0
+        
+        # Clear any temporary numpy arrays that might hold references
+        temp_attrs = ['bloom_filter', 'address_buffer', 'prefix_buffer', 'results_buffer']
+        for attr_name in temp_attrs:
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, None)
 
     def pause(self):
         """Pause the generator"""
