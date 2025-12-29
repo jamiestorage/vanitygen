@@ -115,50 +115,73 @@ class GPUGenerator:
         Args:
             balance_checker: A BalanceChecker instance with addresses loaded
         """
+        print("[DEBUG] set_balance_checker() - Setting up balance checker...")
+        
         self.balance_checker = balance_checker
         if balance_checker and balance_checker.is_loaded:
-            print("Balance checker configured for GPU-accelerated checking")
+            print("[DEBUG] set_balance_checker() - Balance checker loaded, setting up GPU buffers...")
+            
+            # Setup bloom filter for GPU balance checking
+            print("[DEBUG] set_balance_checker() - Creating GPU bloom filter...")
             self._setup_gpu_balance_check()
+            
+            # Also try to setup exact address list in GPU memory (no false positives)
+            print("[DEBUG] set_balance_checker() - Attempting to load full address list to GPU memory...")
+            gpu_list_loaded = self._setup_gpu_address_list()
+            
+            if gpu_list_loaded:
+                print("[DEBUG] set_balance_checker() - ✓ Full address list loaded to GPU memory (exact matching)")
+            else:
+                print("[DEBUG] set_balance_checker() - Using bloom filter only (may have false positives)")
         else:
-            print("Warning: Balance checker not ready (no addresses loaded)")
+            print("[DEBUG] set_balance_checker() - WARNING: Balance checker not ready (no addresses loaded)")
 
     def _setup_gpu_balance_check(self):
         """Set up GPU buffers for balance checking"""
+        print("[DEBUG] _setup_gpu_balance_check() - Starting GPU balance check setup...")
+        
         if not self.balance_checker or not self.ctx:
+            print("[DEBUG] _setup_gpu_balance_check() - FAILED: No balance checker or OpenCL context")
             return
 
         try:
+            print("[DEBUG] _setup_gpu_balance_check() - Creating bloom filter...")
             # Create bloom filter
             self.bloom_filter, self.bloom_filter_size = self.balance_checker.create_bloom_filter()
             if self.bloom_filter is None:
-                print("Failed to create bloom filter")
+                print("[DEBUG] _setup_gpu_balance_check() - FAILED: Could not create bloom filter")
                 return
 
             # Create address buffer for verification
+            print("[DEBUG] _setup_gpu_balance_check() - Creating address buffer...")
             self.address_buffer = self.balance_checker.create_gpu_address_buffer()
             if self.address_buffer is None:
-                print("Failed to create address buffer")
+                print("[DEBUG] _setup_gpu_balance_check() - FAILED: Could not create address buffer")
                 return
 
             # Allocate GPU buffers
             mf = cl.mem_flags
 
             # Bloom filter buffer
+            print("[DEBUG] _setup_gpu_balance_check() - Allocating GPU bloom filter buffer...")
             self.gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                               hostbuf=np.frombuffer(self.bloom_filter, dtype=np.uint8))
 
             # Address buffer for verification (contains hash160 + address pairs)
+            print("[DEBUG] _setup_gpu_balance_check() - Allocating GPU address buffer...")
             self.gpu_address_buffer = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
                                                 hostbuf=np.frombuffer(self.address_buffer, dtype=np.uint8))
 
             # Found count buffer (for tracking potential matches)
+            print("[DEBUG] _setup_gpu_balance_check() - Allocating GPU found count buffer...")
             self.found_count_buffer = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
 
-            print(f"GPU balance checking enabled: {len(self.bloom_filter)} byte bloom filter, "
-                  f"{len(self.address_buffer)} byte address buffer")
+            print(f"[DEBUG] _setup_gpu_balance_check() - ✓ SUCCESS: GPU balance checking enabled")
+            print(f"[DEBUG] _setup_gpu_balance_check() - Bloom filter: {len(self.bloom_filter)} bytes")
+            print(f"[DEBUG] _setup_gpu_balance_check() - Address buffer: {len(self.address_buffer)} bytes")
 
         except Exception as e:
-            print(f"Failed to setup GPU balance checking: {e}")
+            print(f"[DEBUG] _setup_gpu_balance_check() - FAILED: {e}")
             import traceback
             traceback.print_exc()
 
@@ -173,28 +196,32 @@ class GPUGenerator:
         Returns:
             bool: True if setup successful, False otherwise
         """
+        print("[DEBUG] _setup_gpu_address_list() - Starting GPU address list setup...")
+        
         if not self.balance_checker or not self.ctx:
+            print("[DEBUG] _setup_gpu_address_list() - FAILED: No balance checker or OpenCL context")
             return False
         
         try:
+            print("[DEBUG] _setup_gpu_address_list() - Creating GPU address list (sorted array format)...")
             # Create GPU address list (sorted array format)
             address_list_info = self.balance_checker.create_gpu_address_list(format='sorted_array')
             if address_list_info is None:
-                print("Failed to create GPU address list")
+                print("[DEBUG] _setup_gpu_address_list() - FAILED: Could not create GPU address list")
                 return False
             
             # Check GPU memory availability
             device_mem = self.device.global_mem_size
             required_mem = address_list_info['size_bytes']
             
-            print(f"GPU memory available: {device_mem / (1024**3):.2f} GB")
-            print(f"Address list size: {required_mem / (1024**2):.2f} MB ({address_list_info['count']} addresses)")
+            print(f"[DEBUG] _setup_gpu_address_list() - GPU memory available: {device_mem / (1024**3):.2f} GB")
+            print(f"[DEBUG] _setup_gpu_address_list() - Address list size: {required_mem / (1024**2):.2f} MB ({address_list_info['count']} addresses)")
             
             # Ensure we have at least 2x the required memory (for other buffers)
             if required_mem * 2 > device_mem:
-                print(f"WARNING: Insufficient GPU memory!")
-                print(f"Required: {required_mem * 2 / (1024**2):.2f} MB (including overhead)")
-                print(f"Available: {device_mem / (1024**2):.2f} MB")
+                print(f"[DEBUG] _setup_gpu_address_list() - WARNING: Insufficient GPU memory!")
+                print(f"[DEBUG] _setup_gpu_address_list() - Required: {required_mem * 2 / (1024**2):.2f} MB (including overhead)")
+                print(f"[DEBUG] _setup_gpu_address_list() - Available: {device_mem / (1024**2):.2f} MB")
                 return False
             
             # Allocate GPU buffer for address list
@@ -207,29 +234,34 @@ class GPUGenerator:
             )
             self.gpu_address_list_count = address_list_info['count']
             
-            print(f"GPU address list loaded successfully: {self.gpu_address_list_count} addresses")
-            print(f"Memory usage: {required_mem / (1024**2):.2f} MB")
-            print("Using exact matching (NO false positives)")
+            print(f"[DEBUG] _setup_gpu_address_list() - ✓ SUCCESS: {self.gpu_address_list_count} addresses loaded to GPU")
+            print(f"[DEBUG] _setup_gpu_address_list() - Memory usage: {required_mem / (1024**2):.2f} MB")
+            print(f"[DEBUG] _setup_gpu_address_list() - Using exact matching (NO false positives)")
             
             return True
             
         except Exception as e:
-            print(f"Failed to setup GPU address list: {e}")
+            print(f"[DEBUG] _setup_gpu_address_list() - FAILED: {e}")
             import traceback
             traceback.print_exc()
             return False
 
     def init_cl(self):
         """Initialize OpenCL context and compile kernel"""
+        print("[DEBUG] init_cl() - Starting GPU initialization...")
+        
         try:
             if cl is None:
-                print("pyopencl not installed")
+                print("[DEBUG] init_cl() - FAILED: pyopencl not installed")
                 return False
 
+            print("[DEBUG] init_cl() - Searching for OpenCL platforms...")
             platforms = cl.get_platforms()
             if not platforms:
-                print("No OpenCL platforms found")
+                print("[DEBUG] init_cl() - FAILED: No OpenCL platforms found")
                 return False
+            
+            print(f"[DEBUG] init_cl() - Found {len(platforms)} OpenCL platform(s)")
 
             # Select device
             if self.device_selector is not None:
@@ -238,11 +270,13 @@ class GPUGenerator:
                     platform = platforms[p_idx]
                     devices = platform.get_devices()
                     self.device = devices[d_idx]
+                    print(f"[DEBUG] init_cl() - Device selected: {self.device.name}")
                 except Exception as e:
-                    print(f"Invalid OpenCL device selection {self.device_selector}: {e}")
+                    print(f"[DEBUG] init_cl() - FAILED: Invalid OpenCL device selection {self.device_selector}: {e}")
                     return False
             else:
                 # Auto-detect: prefer a GPU device, otherwise fall back to the first available device
+                print("[DEBUG] init_cl() - Auto-detecting GPU device...")
                 selected = None
                 for platform in platforms:
                     try:
@@ -251,57 +285,70 @@ class GPUGenerator:
                         gpus = []
                     if gpus:
                         selected = gpus[0]
+                        print(f"[DEBUG] init_cl() - Found GPU: {selected.name}")
                         break
                 if selected is None:
                     selected = platforms[0].get_devices()[0]
+                    print(f"[DEBUG] init_cl() - No GPU found, using CPU fallback: {selected.name}")
                 self.device = selected
 
+            print(f"[DEBUG] init_cl() - Creating OpenCL context with {self.device.name}...")
             self.ctx = cl.Context([self.device])
             self.queue = cl.CommandQueue(self.ctx)
+            print(f"[DEBUG] init_cl() - Command queue created")
 
             # Load and compile kernel
             kernel_path = os.path.join(os.path.dirname(__file__), 'gpu_kernel.cl')
             if not os.path.exists(kernel_path):
-                print(f"OpenCL kernel not found at {kernel_path}")
+                print(f"[DEBUG] init_cl() - FAILED: OpenCL kernel not found at {kernel_path}")
                 return False
 
+            print(f"[DEBUG] init_cl() - Loading kernel from {kernel_path}...")
             with open(kernel_path, 'r') as f:
                 kernel_source = f.read()
-
+            
+            print(f"[DEBUG] init_cl() - Compiling OpenCL program...")
             self.program = cl.Program(self.ctx, kernel_source).build()
+            print(f"[DEBUG] init_cl() - Program compiled successfully")
+            
+            print("[DEBUG] init_cl() - Compiling kernels...")
             self.kernel = self.program.generate_private_keys
+            print("[DEBUG] init_cl() - ✓ generate_private_keys kernel loaded")
 
             # Compile the generate_and_check kernel for balance checking
             try:
                 self.kernel_check = self.program.generate_and_check
-                print("GPU kernel for balance checking compiled")
-            except Exception:
-                print("Warning: GPU kernel for balance checking not available")
+                print("[DEBUG] init_cl() - ✓ generate_and_check kernel compiled")
+            except Exception as e:
+                print(f"[DEBUG] init_cl() - WARNING: generate_and_check kernel not available: {e}")
                 self.kernel_check = None
 
             # Compile the full GPU kernel for GPU-only mode (no CPU needed)
             try:
                 self.kernel_full = self.program.generate_addresses_full
-                print("Full GPU address generation kernel compiled (GPU-only mode)")
-            except Exception:
-                print("Note: Full GPU kernel not available, will use CPU for address generation")
+                print("[DEBUG] init_cl() - ✓ generate_addresses_full kernel compiled")
+            except Exception as e:
+                print(f"[DEBUG] init_cl() - WARNING: generate_addresses_full kernel not available: {e}")
                 self.kernel_full = None
             
             # Compile the exact address matching kernel for GPU-only mode with direct address list
             try:
                 self.kernel_full_exact = self.program.generate_addresses_full_exact
-                self.kernel_check_address = self.program.check_address_in_gpu_list
-                print("Exact address matching kernel compiled (GPU-only mode with address list)")
+                print("[DEBUG] init_cl() - ✓ generate_addresses_full_exact kernel compiled")
             except Exception as e:
-                print(f"Note: Exact address matching kernel not available: {e}")
+                print(f"[DEBUG] init_cl() - WARNING: generate_addresses_full_exact kernel not available: {e}")
                 self.kernel_full_exact = None
-                self.kernel_check_address = None
 
-            print(f"GPU initialized: {self.device.name}")
+            print(f"[DEBUG] init_cl() - SUCCESS: GPU initialized: {self.device.name}")
+            print(f"[DEBUG] init_cl() - GPU Info:")
+            print(f"  - Device: {self.device.name}")
+            print(f"  - Global Memory: {self.device.global_mem_size / (1024**3):.2f} GB")
+            print(f"  - Max Compute Units: {self.device.max_compute_units}")
+            print(f"  - Max Work Group Size: {self.device.max_work_group_size}")
             return True
 
         except Exception as e:
-            print(f"OpenCL initialization failed: {e}")
+            print(f"[DEBUG] init_cl() - FAILED: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -334,7 +381,11 @@ class GPUGenerator:
     def _generate_keys_on_gpu(self, count):
         """Generate private keys using OpenCL GPU"""
         if not self.gpu_available or self.kernel is None:
+            print("[DEBUG] _generate_keys_on_gpu() - FAILED: GPU not available or kernel not initialized")
             return None
+
+        print(f"[DEBUG] _generate_keys_on_gpu() - Generating {count} private keys on GPU...")
+        print(f"[DEBUG] _generate_keys_on_gpu() - Using seed: {self.rng_seed}")
 
         try:
             # Prepare output buffer (8 uint32 per key = 256 bits)
@@ -345,22 +396,29 @@ class GPUGenerator:
             output_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, output_buffer.nbytes)
 
             # Execute kernel
+            print(f"[DEBUG] _generate_keys_on_gpu() - Executing generate_private_keys kernel...")
             self.kernel(self.queue, (count,), None, output_buf, np.uint64(self.rng_seed), np.uint32(count))
+            print(f"[DEBUG] _generate_keys_on_gpu() - Kernel execution queued, waiting for completion...")
 
             # Read results back
             cl.enqueue_copy(self.queue, output_buffer, output_buf)
             self.queue.finish()
+            print(f"[DEBUG] _generate_keys_on_gpu() - Results transferred from GPU")
 
             # Release buffer to prevent memory leak
             output_buf.release()
+            print(f"[DEBUG] _generate_keys_on_gpu() - Output buffer released")
 
             # Update seed for next batch
             self.rng_seed += count
 
+            print(f"[DEBUG] _generate_keys_on_gpu() - SUCCESS: Generated {count} keys, new seed: {self.rng_seed}")
             return output_buffer.reshape(-1, 8)
 
         except Exception as e:
-            print(f"GPU key generation failed: {e}")
+            print(f"[DEBUG] _generate_keys_on_gpu() - FAILED: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _keys_from_gpu_data(self, gpu_keys):
@@ -386,11 +444,16 @@ class GPUGenerator:
         Only addresses that pass both checks are returned to CPU for verification.
         This significantly reduces CPU load when checking millions of addresses.
         """
+        print("[DEBUG] _search_loop_with_balance_check() - Starting GPU balance checking search loop...")
+        print(f"[DEBUG] _search_loop_with_balance_check() - Batch size: {self.batch_size}")
+        print(f"[DEBUG] _search_loop_with_balance_check() - Prefix: '{self.prefix}'")
+        
         if self.kernel_check is None:
-            print("Balance checking kernel not available, falling back to CPU processing")
+            print("[DEBUG] _search_loop_with_balance_check() - WARNING: Balance checking kernel not available, falling back to CPU processing")
             self._search_loop()
             return
 
+        print("[DEBUG] _search_loop_with_balance_check() - Allocating result buffers...")
         # Allocate result buffer (64 bytes per potential match)
         max_results = 256
         results_buffer = np.zeros(max_results * 64, dtype=np.uint8)
@@ -407,20 +470,27 @@ class GPUGenerator:
         results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
         found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
 
+        print("[DEBUG] _search_loop_with_balance_check() - GPU buffers created, starting search loop...")
+
         try:
+            batch_count = 0
             while not self.stop_event.is_set():
                 # Check if paused
                 if self.pause_event.is_set():
+                    print("[DEBUG] _search_loop_with_balance_check() - Paused, waiting...")
                     time.sleep(0.1)
                     continue
 
                 loop_start = time.time()
+                batch_count += 1
 
                 try:
+                    print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Resetting found count on GPU...")
                     # Reset found count on GPU
                     cl.enqueue_copy(self.queue, found_count_buf, found_count)
                     self.queue.finish()
 
+                    print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Executing generate_and_check kernel with {self.batch_size} items...")
                     # Execute the combined kernel
                     self.kernel_check(
                         self.queue, (self.batch_size,), None,
@@ -437,8 +507,10 @@ class GPUGenerator:
                         np.uint32(max_results)  # max_addresses
                     )
 
+                    print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Waiting for kernel completion...")
                     self.queue.finish()
 
+                    print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Transferring results from GPU...")
                     # Read back results
                     cl.enqueue_copy(self.queue, results_buffer, results_buf)
                     cl.enqueue_copy(self.queue, found_count, found_count_buf)
@@ -449,6 +521,8 @@ class GPUGenerator:
 
                     # Process found results
                     num_found = found_count[0]
+                    print(f"[DEBUG] _search_loop_with_balance_check() - Batch {batch_count}: Found {num_found} potential matches")
+
                     for i in range(min(num_found, max_results)):
                         offset = i * 64
                         # Extract key words (first 32 bytes = 8 uint32)
@@ -480,10 +554,10 @@ class GPUGenerator:
                                     key.get_wif(),
                                     key.get_public_key().hex()
                                 ))
-                                print(f"*** FUNDED ADDRESS FOUND! ***")
-                                print(f"Address: {address}")
-                                print(f"Balance: {balance} satoshis")
-                                print(f"WIF: {key.get_wif()}")
+                                print(f"[DEBUG] _search_loop_with_balance_check() - *** FUNDED ADDRESS FOUND! ***")
+                                print(f"[DEBUG] _search_loop_with_balance_check() - Address: {address}")
+                                print(f"[DEBUG] _search_loop_with_balance_check() - Balance: {balance} satoshis")
+                                print(f"[DEBUG] _search_loop_with_balance_check() - WIF: {key.get_wif()}")
 
                         # Also check prefix match (vanity)
                         if self.prefix and address.startswith(self.prefix):
@@ -498,7 +572,7 @@ class GPUGenerator:
                         self.stats_counter += self.batch_size
 
                 except Exception as e:
-                    print(f"Error in GPU balance checking: {e}")
+                    print(f"[DEBUG] _search_loop_with_balance_check() - ERROR in batch {batch_count}: {e}")
                     import traceback
                     traceback.print_exc()
 
@@ -511,10 +585,12 @@ class GPUGenerator:
                     if sleep_time > 0:
                         self.stop_event.wait(timeout=sleep_time)
         finally:
+            print("[DEBUG] _search_loop_with_balance_check() - Cleaning up GPU buffers...")
             # Clean up GPU buffers to prevent memory leak
             output_keys_buf.release()
             results_buf.release()
             found_count_buf.release()
+            print("[DEBUG] _search_loop_with_balance_check() - Search loop ended")
 
     def _search_loop_gpu_only(self):
         """
@@ -529,6 +605,13 @@ class GPUGenerator:
         Only matching results are returned to CPU for display.
         Zero CPU usage for address generation - GPU handles everything!
         """
+        print("[DEBUG] _search_loop_gpu_only() - Starting GPU-only search loop...")
+        print(f"[DEBUG] _search_loop_gpu_only() - Batch size: {self.batch_size}")
+        print(f"[DEBUG] _search_loop_gpu_only() - Prefix: '{self.prefix}'")
+        print(f"[DEBUG] _search_loop_gpu_only() - Balance checker loaded: {self.balance_checker is not None and self.balance_checker.is_loaded}")
+        print(f"[DEBUG] _search_loop_gpu_only() - GPU bloom filter available: {self.gpu_bloom_filter is not None}")
+        print(f"[DEBUG] _search_loop_gpu_only() - GPU address list buffer available: {self.gpu_address_list_buffer is not None}")
+        
         # Determine which kernel to use based on available resources
         use_exact_matching = (
             self.kernel_full_exact is not None and 
@@ -536,21 +619,30 @@ class GPUGenerator:
             self.gpu_address_list_count > 0
         )
         
+        print(f"[DEBUG] _search_loop_gpu_only() - Exact matching available: {use_exact_matching}")
+        print(f"[DEBUG] _search_loop_gpu_only() - kernel_full available: {self.kernel_full is not None}")
+        print(f"[DEBUG] _search_loop_gpu_only() - kernel_full_exact available: {self.kernel_full_exact is not None}")
+        
         if use_exact_matching:
             # Use exact address matching kernel (NO false positives)
-            print("Using exact address matching kernel (GPU-resident address list)")
+            print("[DEBUG] _search_loop_gpu_only() - Using exact address matching kernel (GPU-resident address list)")
             self._search_loop_gpu_only_exact()
             return
         
-        # Fall back to bloom filter or no balance checking
+        # Check if we should use balance checking with bloom filter
+        if self.balance_checker and self.balance_checker.is_loaded and self.gpu_bloom_filter is not None:
+            print("[DEBUG] _search_loop_gpu_only() - Balance checker loaded, using GPU balance checking mode")
+            self._search_loop_with_balance_check()
+            return
+        
+        # Fall back to GPU-only mode or CPU-assisted mode
         if self.kernel_full is None:
-            print("Full GPU kernel not available, falling back to CPU-assisted mode")
-            if self.balance_checker and self.gpu_bloom_filter is not None:
-                self._search_loop_with_balance_check()
-            else:
-                self._search_loop()
+            print("[DEBUG] _search_loop_gpu_only() - WARNING: Full GPU kernel not available, falling back to CPU-assisted mode")
+            print("[DEBUG] _search_loop_gpu_only() - Using CPU fallback mode")
+            self._search_loop()
             return
 
+        print("[DEBUG] _search_loop_gpu_only() - Allocating result buffers...")
         # Allocate result buffer (128 bytes per potential match: 32 key + 64 addr + 32 spare)
         max_results = 512
         results_buffer = np.zeros(max_results * 128, dtype=np.uint8)
@@ -563,8 +655,8 @@ class GPUGenerator:
         prefix_buffer = np.zeros(64, dtype=np.uint8)
         prefix_buffer[:prefix_len] = np.frombuffer(prefix_bytes, dtype=np.uint8)
 
-        print(f"Starting GPU-only mode (batch size={self.batch_size})")
-        print("All operations (key gen + address generation + matching) on GPU")
+        print(f"[DEBUG] _search_loop_gpu_only() - Starting GPU-only mode (batch size={self.batch_size})")
+        print("[DEBUG] _search_loop_gpu_only() - All operations (key gen + address generation + matching) on GPU")
 
         # Allocate GPU buffer for prefix
         mf = cl.mem_flags
@@ -579,7 +671,7 @@ class GPUGenerator:
         bloom_filter_size = 0
         bloom_buffer = None
         if self.balance_checker and self.balance_checker.is_loaded:
-            print("Setting up GPU bloom filter for balance checking...")
+            print("[DEBUG] _search_loop_gpu_only() - Setting up GPU bloom filter for balance checking...")
             bloom_data, bloom_size = self.balance_checker.create_bloom_filter()
             if bloom_data is not None:
                 check_balance = 1
@@ -589,13 +681,13 @@ class GPUGenerator:
                 gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bloom_buffer)
                 # Store for cleanup
                 self.temp_bloom_buffer = gpu_bloom_filter
-                print(f"Bloom filter: {bloom_filter_size} bytes ({bloom_size} bits)")
+                print(f"[DEBUG] _search_loop_gpu_only() - Bloom filter: {bloom_filter_size} bytes ({bloom_size} bits)")
                 # Clear the buffer reference to free memory
                 del bloom_buffer
             else:
-                print("Bloom filter creation failed, proceeding without balance checking")
+                print("[DEBUG] _search_loop_gpu_only() - WARNING: Bloom filter creation failed, proceeding without balance checking")
         else:
-            print("No balance checker loaded, proceeding without balance checking")
+            print("[DEBUG] _search_loop_gpu_only() - No balance checker loaded, proceeding without balance checking")
 
         # Ensure we have a valid buffer for kernel (even if empty)
         if gpu_bloom_filter is None:
@@ -610,20 +702,27 @@ class GPUGenerator:
         results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
         found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
 
+        print("[DEBUG] _search_loop_gpu_only() - GPU buffers created, starting search loop...")
+
         try:
+            batch_count = 0
             while not self.stop_event.is_set():
                 # Check if paused
                 if self.pause_event.is_set():
+                    print("[DEBUG] _search_loop_gpu_only() - Paused, waiting...")
                     time.sleep(0.1)
                     continue
 
                 loop_start = time.time()
+                batch_count += 1
 
                 try:
+                    print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Resetting found count on GPU...")
                     # Reset found count on GPU
                     cl.enqueue_copy(self.queue, found_count_buf, found_count)
                     self.queue.finish()
 
+                    print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Executing generate_addresses_full kernel with {self.batch_size} items...")
                     # Execute the full GPU kernel with bloom filter support
                     self.kernel_full(
                         self.queue, (self.batch_size,), None,
@@ -639,8 +738,10 @@ class GPUGenerator:
                         np.uint32(check_balance)  # check_balance
                     )
 
+                    print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Waiting for kernel completion...")
                     self.queue.finish()
 
+                    print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Transferring results from GPU...")
                     # Read back results
                     cl.enqueue_copy(self.queue, results_buffer, results_buf)
                     cl.enqueue_copy(self.queue, found_count, found_count_buf)
@@ -656,6 +757,7 @@ class GPUGenerator:
                     # Process found results
                     # First pass: check bloom filter matches (high priority)
                     num_found = found_count[0]
+                    print(f"[DEBUG] _search_loop_gpu_only() - Batch {batch_count}: Found {num_found} potential matches")
 
                     # Collect all results first
                     results = []
