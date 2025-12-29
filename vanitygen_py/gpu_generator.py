@@ -64,8 +64,10 @@ class GPUGenerator:
         self.stats_counter = 0
         self.stats_lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()  # For pause/resume
         self.gpu_available = False
         self.pool = None
+        self.paused = False
 
         # OpenCL resources
         self.ctx = None
@@ -324,6 +326,11 @@ class GPUGenerator:
         prefix_len = len(self.prefix)
 
         while not self.stop_event.is_set():
+            # Check if paused
+            if self.pause_event.is_set():
+                time.sleep(0.1)
+                continue
+
             loop_start = time.time()
 
             try:
@@ -492,6 +499,11 @@ class GPUGenerator:
             gpu_bloom_filter = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=dummy_buffer)
 
         while not self.stop_event.is_set():
+            # Check if paused
+            if self.pause_event.is_set():
+                time.sleep(0.1)
+                continue
+
             loop_start = time.time()
 
             try:
@@ -609,6 +621,11 @@ class GPUGenerator:
             self.pool = multiprocessing.Pool(processes=num_workers)
 
         while not self.stop_event.is_set():
+            # Check if paused
+            if self.pause_event.is_set():
+                time.sleep(0.1)
+                continue
+
             loop_start = time.time()
 
             # Generate batch of keys on GPU
@@ -744,8 +761,22 @@ class GPUGenerator:
                 pass
             self.found_count_buffer = None
 
+    def pause(self):
+        """Pause the generator"""
+        self.paused = True
+        self.pause_event.set()
+
+    def resume(self):
+        """Resume the generator"""
+        self.paused = False
+        self.pause_event.clear()
+
+    def is_paused(self):
+        """Check if generator is paused"""
+        return self.paused
+
     def get_stats(self):
         with self.stats_lock:
             count = self.stats_counter
             self.stats_counter = 0
-            return count
+        return count
