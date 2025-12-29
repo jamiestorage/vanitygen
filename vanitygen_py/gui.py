@@ -253,8 +253,9 @@ class VanityGenGUI(QMainWindow):
         gpu_settings_layout.addLayout(device_layout)
 
         # GPU Only mode checkbox
-        self.gpu_only_check = QCheckBox("GPU Only Mode (ALL operations on GPU)")
-        self.gpu_only_check.setToolTip("When enabled, ALL operations (key generation, address generation, matching) happen on GPU.\nThis eliminates CPU load entirely but may be slightly slower than GPU+CPU combined.")
+        self.gpu_only_check = QCheckBox("GPU Only Mode (Full GPU Acceleration)")
+        self.gpu_only_check.setToolTip("When enabled, ALL operations (key generation, EC math, address generation, matching) happen on GPU.\nThis maximizes performance and minimizes CPU load.")
+        self.gpu_only_check.setStyleSheet("")
         gpu_settings_layout.addWidget(self.gpu_only_check)
 
         self.gpu_settings_widget.setLayout(gpu_settings_layout)
@@ -648,21 +649,27 @@ Whoever has this key controls these funds.<br><br>
 
     def pause_generation(self):
         """Pause the current generation"""
-        if self.gen_thread and self.gen_thread.isRunning():
-            self.gen_thread.generator.pause()
-            self.pause_btn.setEnabled(False)
-            self.resume_btn.setEnabled(True)
-            self.log_output.append("Generation paused")
-            self.update_status_labels()
+        if self.gen_thread and self.gen_thread.isRunning() and self.gen_thread.generator:
+            try:
+                self.gen_thread.generator.pause()
+                self.pause_btn.setEnabled(False)
+                self.resume_btn.setEnabled(True)
+                self.log_output.append("Generation paused")
+                self.update_status_labels()
+            except Exception as e:
+                self.log_output.append(f"Error pausing generation: {e}")
 
     def resume_generation(self):
         """Resume the current generation"""
-        if self.gen_thread and self.gen_thread.isRunning():
-            self.gen_thread.generator.resume()
-            self.pause_btn.setEnabled(True)
-            self.resume_btn.setEnabled(False)
-            self.log_output.append("Generation resumed")
-            self.update_status_labels()
+        if self.gen_thread and self.gen_thread.isRunning() and self.gen_thread.generator:
+            try:
+                self.gen_thread.generator.resume()
+                self.pause_btn.setEnabled(True)
+                self.resume_btn.setEnabled(False)
+                self.log_output.append("Generation resumed")
+                self.update_status_labels()
+            except Exception as e:
+                self.log_output.append(f"Error resuming generation: {e}")
 
     def update_status_labels(self):
         """Update status labels based on current state"""

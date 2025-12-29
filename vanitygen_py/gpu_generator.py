@@ -351,6 +351,9 @@ class GPUGenerator:
             cl.enqueue_copy(self.queue, output_buffer, output_buf)
             self.queue.finish()
 
+            # Release buffer to prevent memory leak
+            output_buf.release()
+
             # Update seed for next batch
             self.rng_seed += count
 
@@ -397,125 +400,121 @@ class GPUGenerator:
         prefix_bytes = np.frombuffer(self.prefix.encode('ascii'), dtype=np.uint8)
         prefix_len = len(self.prefix)
 
-        while not self.stop_event.is_set():
-            # Check if paused
-            if self.pause_event.is_set():
-                time.sleep(0.1)
-                continue
+        mf = cl.mem_flags
+        # Create output buffers once and reuse to prevent memory leaks
+        output_keys = np.zeros(self.batch_size * 8, dtype=np.uint32)
+        output_keys_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, output_keys.nbytes)
+        results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
+        found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
 
-            loop_start = time.time()
+        try:
+            while not self.stop_event.is_set():
+                # Check if paused
+                if self.pause_event.is_set():
+                    time.sleep(0.1)
+                    continue
 
-            try:
-                mf = cl.mem_flags
+                loop_start = time.time()
 
-                # Create output buffers
-                output_keys = np.zeros(self.batch_size * 8, dtype=np.uint32)
+                try:
+                    # Reset found count on GPU
+                    cl.enqueue_copy(self.queue, found_count_buf, found_count)
+                    self.queue.finish()
 
-                # Create GPU buffer for output keys
-                output_keys_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, output_keys.nbytes)
+                    # Execute the combined kernel
+                    self.kernel_check(
+                        self.queue, (self.batch_size,), None,
+                        output_keys_buf,  # output_keys
+                        results_buf,  # found_addresses (not used directly)
+                        found_count_buf,  # found_count
+                        np.uint64(self.rng_seed),  # seed
+                        np.uint32(self.batch_size),  # batch_size
+                        self.gpu_bloom_filter,  # bloom_filter
+                        np.uint32(self.bloom_filter_size),  # filter_size
+                        np.frombuffer(prefix_bytes, dtype=np.uint8),  # prefix
+                        np.int32(prefix_len),  # prefix_len
+                        self.gpu_address_buffer,  # addresses_buffer
+                        np.uint32(max_results)  # max_addresses
+                    )
 
-                # Ensure buffers are on GPU
-                results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
-                found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
+                    self.queue.finish()
 
-                # Reset found count on GPU
-                cl.enqueue_copy(self.queue, found_count_buf, found_count)
-                self.queue.finish()
+                    # Read back results
+                    cl.enqueue_copy(self.queue, results_buffer, results_buf)
+                    cl.enqueue_copy(self.queue, found_count, found_count_buf)
+                    self.queue.finish()
 
-                # Execute the combined kernel
-                self.kernel_check(
-                    self.queue, (self.batch_size,), None,
-                    output_keys_buf,  # output_keys
-                    results_buf,  # found_addresses (not used directly)
-                    found_count_buf,  # found_count
-                    np.uint64(self.rng_seed),  # seed
-                    np.uint32(self.batch_size),  # batch_size
-                    self.gpu_bloom_filter,  # bloom_filter
-                    np.uint32(self.bloom_filter_size),  # filter_size
-                    np.frombuffer(prefix_bytes, dtype=np.uint8),  # prefix
-                    np.int32(prefix_len),  # prefix_len
-                    self.gpu_address_buffer,  # addresses_buffer
-                    np.uint32(max_results)  # max_addresses
-                )
+                    # Update seed
+                    self.rng_seed += self.batch_size
 
-                self.queue.finish()
+                    # Process found results
+                    num_found = found_count[0]
+                    for i in range(min(num_found, max_results)):
+                        offset = i * 64
+                        # Extract key words (first 32 bytes = 8 uint32)
+                        key_words = []
+                        for j in range(8):
+                            word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
+                            key_words.append(word)
+                        key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
 
-                # Read back results
-                cl.enqueue_copy(self.queue, results_buffer, results_buf)
-                cl.enqueue_copy(self.queue, found_count, found_count_buf)
-                self.queue.finish()
+                        # Extract address string
+                        addr_end = offset + 54
+                        addr = ''
+                        for k in range(offset + 32, addr_end):
+                            if results_buffer[k] == 0:
+                                break
+                            addr += chr(results_buffer[k])
 
-                # Update seed
-                self.rng_seed += self.batch_size
+                        # Verify on CPU and check balance
+                        key = BitcoinKey(key_bytes)
+                        address = key.get_p2pkh_address()
 
-                # Clean up GPU buffers to prevent memory leak
-                output_keys_buf.release()
-                results_buf.release()
-                found_count_buf.release()
+                        # Verify balance on CPU
+                        if self.balance_checker:
+                            balance = self.balance_checker.check_balance(address)
+                            if balance > 0:
+                                # Funded address found!
+                                self.result_queue.put((
+                                    address,
+                                    key.get_wif(),
+                                    key.get_public_key().hex()
+                                ))
+                                print(f"*** FUNDED ADDRESS FOUND! ***")
+                                print(f"Address: {address}")
+                                print(f"Balance: {balance} satoshis")
+                                print(f"WIF: {key.get_wif()}")
 
-                # Process found results
-                num_found = found_count[0]
-                for i in range(min(num_found, max_results)):
-                    offset = i * 64
-                    # Extract key words (first 32 bytes = 8 uint32)
-                    key_words = []
-                    for j in range(8):
-                        word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
-                        key_words.append(word)
-                    key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
-
-                    # Extract address string
-                    addr_end = offset + 54
-                    addr = ''
-                    for k in range(offset + 32, addr_end):
-                        if results_buffer[k] == 0:
-                            break
-                        addr += chr(results_buffer[k])
-
-                    # Verify on CPU and check balance
-                    key = BitcoinKey(key_bytes)
-                    address = key.get_p2pkh_address()
-
-                    # Verify balance on CPU
-                    if self.balance_checker:
-                        balance = self.balance_checker.check_balance(address)
-                        if balance > 0:
-                            # Funded address found!
+                        # Also check prefix match (vanity)
+                        if self.prefix and address.startswith(self.prefix):
                             self.result_queue.put((
                                 address,
                                 key.get_wif(),
                                 key.get_public_key().hex()
                             ))
-                            print(f"*** FUNDED ADDRESS FOUND! ***")
-                            print(f"Address: {address}")
-                            print(f"Balance: {balance} satoshis")
-                            print(f"WIF: {key.get_wif()}")
 
-                    # Also check prefix match (vanity)
-                    if self.prefix and address.startswith(self.prefix):
-                        self.result_queue.put((
-                            address,
-                            key.get_wif(),
-                            key.get_public_key().hex()
-                        ))
+                    # Update stats
+                    with self.stats_lock:
+                        self.stats_counter += self.batch_size
 
-                # Update stats
-                with self.stats_lock:
-                    self.stats_counter += self.batch_size
+                except Exception as e:
+                    print(f"Error in GPU balance checking: {e}")
+                    import traceback
+                    traceback.print_exc()
 
-            except Exception as e:
-                print(f"Error in GPU balance checking: {e}")
-                import traceback
-                traceback.print_exc()
-
-            # Power throttling
-            power = self.power_percent
-            if power is not None and power < 100:
-                duty = max(0.05, min(1.0, power / 100.0))
-                work_time = time.time() - loop_start
-                sleep_time = work_time * (1.0 / duty - 1.0)
-                if sleep_time > 0:
-                    self.stop_event.wait(timeout=sleep_time)
+                # Power throttling
+                power = self.power_percent
+                if power is not None and power < 100:
+                    duty = max(0.05, min(1.0, power / 100.0))
+                    work_time = time.time() - loop_start
+                    sleep_time = work_time * (1.0 / duty - 1.0)
+                    if sleep_time > 0:
+                        self.stop_event.wait(timeout=sleep_time)
+        finally:
+            # Clean up GPU buffers to prevent memory leak
+            output_keys_buf.release()
+            results_buf.release()
+            found_count_buf.release()
 
     def _search_loop_gpu_only(self):
         """
@@ -606,119 +605,140 @@ class GPUGenerator:
             self.temp_bloom_buffer = gpu_bloom_filter
             del dummy_buffer
 
-        while not self.stop_event.is_set():
-            # Check if paused
-            if self.pause_event.is_set():
-                time.sleep(0.1)
-                continue
+        # Create output buffer for results once and reuse
+        mf = cl.mem_flags
+        results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
+        found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
 
-            loop_start = time.time()
+        try:
+            while not self.stop_event.is_set():
+                # Check if paused
+                if self.pause_event.is_set():
+                    time.sleep(0.1)
+                    continue
 
-            try:
-                mf = cl.mem_flags
+                loop_start = time.time()
 
-                # Create output buffer for results
-                results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
-                found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
-
-                # Reset found count on GPU
-                cl.enqueue_copy(self.queue, found_count_buf, found_count)
-                self.queue.finish()
-
-                # Execute the full GPU kernel with bloom filter support
-                self.kernel_full(
-                    self.queue, (self.batch_size,), None,
-                    results_buf,           # found_addresses
-                    found_count_buf,       # found_count
-                    np.uint64(self.rng_seed),  # seed
-                    np.uint32(self.batch_size),  # batch_size
-                    gpu_prefix_buffer,     # prefix (must be a cl.Buffer)
-                    np.int32(prefix_len),  # prefix_len
-                    np.uint32(max_results), # max_addresses
-                    gpu_bloom_filter if gpu_bloom_filter else np.uint32(0),  # bloom_filter
-                    np.uint32(bloom_filter_size),  # filter_size
-                    np.uint32(check_balance)  # check_balance
-                )
-
-                self.queue.finish()
-
-                # Read back results
-                cl.enqueue_copy(self.queue, results_buffer, results_buf)
-                cl.enqueue_copy(self.queue, found_count, found_count_buf)
-                self.queue.finish()
-
-                # Update seed
-                self.rng_seed += self.batch_size
-
-                # Clean up GPU buffers to prevent memory leak
-                results_buf.release()
-                found_count_buf.release()
-
-                # Update stats BEFORE processing results to ensure counter increments even on errors
-                with self.stats_lock:
-                    self.stats_counter += self.batch_size
-
-                # Process found results
-                # First pass: check bloom filter matches (high priority)
-                num_found = found_count[0]
-
-                # Collect all results first
-                results = []
                 try:
-                    for i in range(min(num_found, max_results)):
-                        offset = i * 128
+                    # Reset found count on GPU
+                    cl.enqueue_copy(self.queue, found_count_buf, found_count)
+                    self.queue.finish()
 
-                        # Extract key words (first 32 bytes = 8 uint32)
-                        key_words = []
-                        for j in range(8):
-                            word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
-                            key_words.append(word)
-                        key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
+                    # Execute the full GPU kernel with bloom filter support
+                    self.kernel_full(
+                        self.queue, (self.batch_size,), None,
+                        results_buf,           # found_addresses
+                        found_count_buf,       # found_count
+                        np.uint64(self.rng_seed),  # seed
+                        np.uint32(self.batch_size),  # batch_size
+                        gpu_prefix_buffer,     # prefix (must be a cl.Buffer)
+                        np.int32(prefix_len),  # prefix_len
+                        np.uint32(max_results), # max_addresses
+                        gpu_bloom_filter if gpu_bloom_filter else np.uint32(0),  # bloom_filter
+                        np.uint32(bloom_filter_size),  # filter_size
+                        np.uint32(check_balance)  # check_balance
+                    )
 
-                        # Extract address string (after key, null-terminated)
-                        addr_start = offset + 32
-                        addr_end = offset + 96  # Allow up to 64 chars for address
-                        addr = ''
-                        for k in range(addr_start, addr_end):
-                            if results_buffer[k] == 0:
-                                break
-                            addr += chr(results_buffer[k])
+                    self.queue.finish()
 
-                        # Check if bloom filter matched (byte 96)
-                        bloom_match = results_buffer[offset + 96] == 1
+                    # Read back results
+                    cl.enqueue_copy(self.queue, results_buffer, results_buf)
+                    cl.enqueue_copy(self.queue, found_count, found_count_buf)
+                    self.queue.finish()
 
-                        results.append((addr, key_bytes, bloom_match))
+                    # Update seed
+                    self.rng_seed += self.batch_size
 
-                    # Sort results: bloom filter matches first
-                    results.sort(key=lambda x: not x[2])
+                    # Update stats BEFORE processing results to ensure counter increments even on errors
+                    with self.stats_lock:
+                        self.stats_counter += self.batch_size
 
-                    # Process results
-                    for addr, key_bytes, bloom_match in results:
-                        if addr:
-                            # Generate WIF and public key from key_bytes
-                            key = BitcoinKey(key_bytes)
-                            wif = key.get_wif()
-                            pubkey = key.get_public_key().hex()
-                            # Report result with full key information
-                            self.result_queue.put((addr, wif, pubkey))
+                    # Process found results
+                    # First pass: check bloom filter matches (high priority)
+                    num_found = found_count[0]
+
+                    # Collect all results first
+                    results = []
+                    try:
+                        for i in range(min(num_found, max_results)):
+                            offset = i * 128
+
+                            # Extract key words (first 32 bytes = 8 uint32)
+                            key_words = []
+                            for j in range(8):
+                                word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
+                                key_words.append(word)
+                            key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
+
+                            # Extract address string (after key, null-terminated)
+                            addr_start = offset + 32
+                            addr_end = offset + 96  # Allow up to 64 chars for address
+                            addr = ''
+                            for k in range(addr_start, addr_end):
+                                if results_buffer[k] == 0:
+                                    break
+                                addr += chr(results_buffer[k])
+
+                            # Check if bloom filter matched (byte 96)
+                            bloom_match = results_buffer[offset + 96] == 1
+
+                            results.append((addr, key_bytes, bloom_match))
+
+                        # Sort results: bloom filter matches first
+                        results.sort(key=lambda x: not x[2])
+
+                        # Process results
+                        for addr, key_bytes, bloom_match in results:
+                            if addr:
+                                # Generate WIF and public key from key_bytes
+                                key = BitcoinKey(key_bytes)
+                                
+                                # CRITICAL: Verify address on CPU because GPU EC is currently fake
+                                # This ensures we don't report invalid addresses
+                                real_addr = key.get_p2pkh_address()
+                                
+                                # Only report if it's a real match (prefix or bloom)
+                                # Note: The match found on GPU was based on fake EC, so it's likely
+                                # the real address won't match. But we MUST report the real one.
+                                is_real_match = False
+                                if self.prefix and real_addr.startswith(self.prefix):
+                                    is_real_match = True
+                                
+                                if bloom_match and self.balance_checker:
+                                    balance = self.balance_checker.check_balance(real_addr)
+                                    if balance > 0:
+                                        is_real_match = True
+                                
+                                # If no balance checker or no prefix, but it was reported, 
+                                # we should still check why. In GPU-only mode, if neither 
+                                # is set, it shouldn't really be finding anything anyway.
+                                
+                                if is_real_match:
+                                    wif = key.get_wif()
+                                    pubkey = key.get_public_key().hex()
+                                    # Report result with full key information
+                                    self.result_queue.put((real_addr, wif, pubkey))
+                    except Exception as e:
+                        print(f"Error processing GPU results: {e}")
+                        import traceback
+                        traceback.print_exc()
+
                 except Exception as e:
-                    print(f"Error processing GPU results: {e}")
+                    print(f"Error in GPU-only mode: {e}")
                     import traceback
                     traceback.print_exc()
 
-            except Exception as e:
-                print(f"Error in GPU-only mode: {e}")
-                import traceback
-                traceback.print_exc()
-
-            # Power throttling
-            power = self.power_percent
-            if power is not None and power < 100:
-                duty = max(0.05, min(1.0, power / 100.0))
-                work_time = time.time() - loop_start
-                sleep_time = work_time * (1.0 / duty - 1.0)
-                if sleep_time > 0:
-                    self.stop_event.wait(timeout=sleep_time)
+                # Power throttling
+                power = self.power_percent
+                if power is not None and power < 100:
+                    duty = max(0.05, min(1.0, power / 100.0))
+                    work_time = time.time() - loop_start
+                    sleep_time = work_time * (1.0 / duty - 1.0)
+                    if sleep_time > 0:
+                        self.stop_event.wait(timeout=sleep_time)
+        finally:
+            results_buf.release()
+            found_count_buf.release()
 
         # Clean up temporary bloom filter buffer when loop exits
         if hasattr(self, 'temp_bloom_buffer') and self.temp_bloom_buffer is not None:
@@ -776,129 +796,133 @@ class GPUGenerator:
         matches_found = 0
         addresses_checked = 0
         
-        while not self.stop_event.is_set():
-            # Check if paused
-            if self.pause_event.is_set():
-                time.sleep(0.1)
-                continue
-            
-            loop_start = time.time()
-            
-            try:
-                mf = cl.mem_flags
+        # Create output buffer for results once and reuse to prevent memory leaks
+        mf = cl.mem_flags
+        results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
+        found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE, 4)
+
+        try:
+            while not self.stop_event.is_set():
+                # Check if paused
+                if self.pause_event.is_set():
+                    time.sleep(0.1)
+                    continue
                 
-                # Create output buffer for results
-                results_buf = cl.Buffer(self.ctx, mf.WRITE_ONLY, results_buffer.nbytes)
-                found_count_buf = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=found_count)
+                loop_start = time.time()
                 
-                # Reset found count on GPU
-                cl.enqueue_copy(self.queue, found_count_buf, found_count)
-                self.queue.finish()
-                
-                # Determine if we should check addresses
-                check_addresses = 1 if self.gpu_address_list_buffer is not None else 0
-                
-                # Execute the exact matching kernel
-                self.kernel_full_exact(
-                    self.queue, (self.batch_size,), None,
-                    results_buf,                              # found_addresses
-                    found_count_buf,                          # found_count
-                    np.uint64(self.rng_seed),                 # seed
-                    np.uint32(self.batch_size),               # batch_size
-                    gpu_prefix_buffer,                        # prefix
-                    np.int32(prefix_len),                     # prefix_len
-                    np.uint32(max_results),                   # max_addresses
-                    self.gpu_address_list_buffer if self.gpu_address_list_buffer else np.uint32(0),  # address_list
-                    np.uint32(self.gpu_address_list_count),   # address_list_count
-                    np.uint32(check_addresses)                # check_addresses
-                )
-                
-                self.queue.finish()
-                
-                # Read back results
-                cl.enqueue_copy(self.queue, results_buffer, results_buf)
-                cl.enqueue_copy(self.queue, found_count, found_count_buf)
-                self.queue.finish()
-                
-                # Update seed
-                self.rng_seed += self.batch_size
-                
-                # Clean up GPU buffers to prevent memory leak
-                results_buf.release()
-                found_count_buf.release()
-                
-                # Update stats BEFORE processing results
-                addresses_checked += self.batch_size
-                with self.stats_lock:
-                    self.stats_counter += self.batch_size
-                
-                # Process found results
-                num_found = found_count[0]
-                
-                if num_found > 0:
-                    matches_found += num_found
-                    print(f"Found {num_found} matches! (Total: {matches_found})")
-                
-                # Collect all results
-                results = []
                 try:
-                    for i in range(min(num_found, max_results)):
-                        offset = i * 128
-                        
-                        # Extract key words (first 32 bytes = 8 uint32)
-                        key_words = []
-                        for j in range(8):
-                            word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
-                            key_words.append(word)
-                        key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
-                        
-                        # Extract address string (after key, null-terminated)
-                        addr_start = offset + 32
-                        addr_end = offset + 96  # Allow up to 64 chars for address
-                        addr = ''
-                        for k in range(addr_start, addr_end):
-                            if results_buffer[k] == 0:
-                                break
-                            addr += chr(results_buffer[k])
-                        
-                        # Check if this is a funded address (byte 96)
-                        is_funded = results_buffer[offset + 96] == 1
-                        
-                        results.append((addr, key_bytes, is_funded))
-                    
-                    # Sort results: funded addresses first
-                    results.sort(key=lambda x: not x[2])
-                    
-                    # Process results
-                    for addr, key_bytes, is_funded in results:
-                        if addr:
-                            # Generate WIF and public key from key_bytes
-                            key = BitcoinKey(key_bytes)
-                            wif = key.get_wif()
-                            pubkey = key.get_public_key().hex()
-                            
-                            # Report result
-                            if is_funded and self.balance_checker:
-                                # Double-check balance on CPU for accuracy
-                                balance = self.balance_checker.check_balance(addr)
-                                if balance > 0:
-                                    print(f"*** FUNDED ADDRESS FOUND! ***")
-                                    print(f"Address: {addr}")
-                                    print(f"Balance: {balance} satoshis")
-                                    print(f"WIF: {wif}")
-                            
-                            # Report result with full key information
-                            self.result_queue.put((addr, wif, pubkey))
-                            
+                    # Reset found count on GPU
+                    cl.enqueue_copy(self.queue, found_count_buf, found_count)
+                    self.queue.finish()
+
+                    # Determine if we should check addresses
+                    check_addresses = 1 if self.gpu_address_list_buffer is not None else 0
+
+                    # Execute the exact matching kernel
+                    self.kernel_full_exact(
+                        self.queue, (self.batch_size,), None,
+                        results_buf,                              # found_addresses
+                        found_count_buf,                          # found_count
+                        np.uint64(self.rng_seed),                 # seed
+                        np.uint32(self.batch_size),               # batch_size
+                        gpu_prefix_buffer,                        # prefix
+                        np.int32(prefix_len),                     # prefix_len
+                        np.uint32(max_results),                   # max_addresses
+                        self.gpu_address_list_buffer if self.gpu_address_list_buffer else np.uint32(0),  # address_list
+                        np.uint32(self.gpu_address_list_count),   # address_list_count
+                        np.uint32(check_addresses)                # check_addresses
+                    )
+
+                    self.queue.finish()
+
+                    # Read back results
+                    cl.enqueue_copy(self.queue, results_buffer, results_buf)
+                    cl.enqueue_copy(self.queue, found_count, found_count_buf)
+                    self.queue.finish()
+
+                    # Update seed
+                    self.rng_seed += self.batch_size
+
+                    # Update stats BEFORE processing results
+                    addresses_checked += self.batch_size
+                    with self.stats_lock:
+                        self.stats_counter += self.batch_size
+
+                    # Process found results
+                    num_found = found_count[0]
+
+                    if num_found > 0:
+                        matches_found += num_found
+                        print(f"Found {num_found} matches! (Total: {matches_found})")
+
+                    # Collect all results
+                    results = []
+                    try:
+                        for i in range(min(num_found, max_results)):
+                            offset = i * 128
+
+                            # Extract key words (first 32 bytes = 8 uint32)
+                            key_words = []
+                            for j in range(8):
+                                word = int.from_bytes(results_buffer[offset + j*4:offset + j*4 + 4], 'little')
+                                key_words.append(word)
+                            key_bytes = b''.join(struct.pack('<I', word) for word in key_words)
+
+                            # Extract address string (after key, null-terminated)
+                            addr_start = offset + 32
+                            addr_end = offset + 96  # Allow up to 64 chars for address
+                            addr = ''
+                            for k in range(addr_start, addr_end):
+                                if results_buffer[k] == 0:
+                                    break
+                                addr += chr(results_buffer[k])
+
+                            # Check if this is a funded address (byte 96)
+                            is_funded = results_buffer[offset + 96] == 1
+
+                            results.append((addr, key_bytes, is_funded))
+
+                        # Sort results: funded addresses first
+                        results.sort(key=lambda x: not x[2])
+
+                        # Process results
+                        for addr, key_bytes, is_funded in results:
+                            if addr:
+                                # Generate WIF and public key from key_bytes
+                                key = BitcoinKey(key_bytes)
+
+                                # CRITICAL: Verify address on CPU because GPU EC is currently fake
+                                real_addr = key.get_p2pkh_address()
+
+                                # Only report if it's a real match
+                                is_real_match = False
+                                if self.prefix and real_addr.startswith(self.prefix):
+                                    is_real_match = True
+
+                                if is_funded and self.balance_checker:
+                                    balance = self.balance_checker.check_balance(real_addr)
+                                    if balance > 0:
+                                        is_real_match = True
+                                        print(f"*** FUNDED ADDRESS FOUND! ***")
+                                        print(f"Address: {real_addr}")
+                                        print(f"Balance: {balance} satoshis")
+                                        print(f"WIF: {key.get_wif()}")
+
+                                if is_real_match:
+                                    wif = key.get_wif()
+                                    pubkey = key.get_public_key().hex()
+                                    # Report result with full key information
+                                    self.result_queue.put((real_addr, wif, pubkey))
+
+                    except Exception as e:
+                        print(f"Error processing GPU results: {e}")
+                        import traceback
+                        traceback.print_exc()
+
                 except Exception as e:
-                    print(f"Error processing GPU results: {e}")
+                    print(f"Error in GPU-only exact matching mode: {e}")
                     import traceback
                     traceback.print_exc()
-                
-            except Exception as e:
-                print(f"Error in GPU-only exact matching mode: {e}")
-                import traceback
-                traceback.print_exc()
             
             # Power throttling
             power = self.power_percent
@@ -908,6 +932,9 @@ class GPUGenerator:
                 sleep_time = work_time * (1.0 / duty - 1.0)
                 if sleep_time > 0:
                     self.stop_event.wait(timeout=sleep_time)
+        finally:
+            results_buf.release()
+            found_count_buf.release()
         
         # Clean up buffers when loop exits
         if hasattr(self, 'gpu_prefix_buffer_exact') and self.gpu_prefix_buffer_exact is not None:
@@ -987,7 +1014,7 @@ class GPUGenerator:
         self.pause_event.clear()
         self.paused = False
         self.stats_counter = 0
-        self.rng_seed = int(time.time())
+        self.rng_seed = struct.unpack('<Q', os.urandom(8))[0]
 
         # Clear result queue
         try:
